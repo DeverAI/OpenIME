@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build / package
+build/
+dist/
+*.spec
+*.exe
+
+# Logs & temp
+*.log
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Local secrets — never commit
+.env
+.env.*
+*All_Apis*
+*secrets*
+*credentials*
+*.pem
+*.key
+
+# Editor
+.vscode/
+.idea/

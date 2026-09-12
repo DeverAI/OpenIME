@@ -1,0 +1,6 @@
+pypinyin>=0.50.0
+pypdf>=4.0.0
+python-docx>=1.1.0
+PyInstaller>=6.0
+# 可选：PDF 中文抽取质量更好
+# pymupdf>=1.24.0
