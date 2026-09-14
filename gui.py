@@ -112,7 +112,7 @@ class App(tk.Tk):
         box2.pack(fill="x", padx=18, pady=4)
         row3 = ttk.Frame(box2, style="Card.TFrame")
         row3.pack(fill="x", padx=10, pady=8)
-        self._btn(row3, "搜索 / 删除", self.on_view, False).pack(side="left", expand=True, fill="x", padx=(0, 6))
+        self._btn(row3, "浏览词库", self.on_view, False).pack(side="left", expand=True, fill="x", padx=(0, 6))
         self._btn(row3, "备份", self.on_backup, False).pack(side="left", expand=True, fill="x", padx=6)
         self._btn(row3, "恢复…", self.on_restore, False).pack(side="left", expand=True, fill="x", padx=6)
         self._btn(row3, "导出词库包", self.on_export, False).pack(side="left", expand=True, fill="x", padx=6)
@@ -428,60 +428,169 @@ class App(tk.Tk):
 
     def on_view(self):
         win = tk.Toplevel(self)
-        win.title("搜索 / 删除")
+        win.title("浏览词库")
         win.configure(bg=BG)
-        win.geometry("700x520")
+        win.geometry("820x580")
+        win.minsize(720, 480)
         win.transient(self)
 
-        bar = ttk.Frame(win)
-        bar.pack(fill="x", padx=12, pady=10)
-        ttk.Label(bar, text="关键词：").pack(side="left")
-        kw = tk.Entry(bar, font=("Microsoft YaHei UI", 11), width=28)
-        kw.pack(side="left", padx=6)
+        state = {"page": 0, "page_size": 80}
 
-        tree_frame = ttk.Frame(win)
-        tree_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-        tree = ttk.Treeview(tree_frame, columns=("word", "pinyin"), show="headings", height=16)
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=12, pady=(10, 4))
+        ttk.Label(top, text="搜索：").pack(side="left")
+        kw = tk.Entry(top, font=("Microsoft YaHei UI", 11), width=28)
+        kw.pack(side="left", padx=6)
+        ttk.Label(
+            top,
+            text="可输入：明月 / mingyue / ming yue / my",
+            style="Sub.TLabel",
+        ).pack(side="left", padx=8)
+
+        mid = ttk.Frame(win)
+        mid.pack(fill="both", expand=True, padx=12, pady=4)
+        tree = ttk.Treeview(
+            mid,
+            columns=("no", "word", "pinyin", "jianpin"),
+            show="headings",
+            height=16,
+        )
+        tree.heading("no", text="#")
         tree.heading("word", text="词条")
         tree.heading("pinyin", text="拼音")
-        tree.column("word", width=280)
-        tree.column("pinyin", width=300)
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.heading("jianpin", text="简拼")
+        tree.column("no", width=56, anchor="e")
+        tree.column("word", width=220)
+        tree.column("pinyin", width=360)
+        tree.column("jianpin", width=70, anchor="center")
+        vsb = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
         tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
-        status = ttk.Label(win, text="", style="Sub.TLabel")
-        status.pack(anchor="w", padx=14, pady=(0, 8))
+        bottom = ttk.Frame(win)
+        bottom.pack(fill="x", padx=12, pady=(2, 8))
+        info = ttk.Label(bottom, text="", style="Sub.TLabel")
+        info.pack(side="left")
 
-        def do_search(*_):
+        def refresh():
             tree.delete(*tree.get_children())
             try:
-                hits = app_core.search_entries(kw.get().strip(), limit=300)
+                r = app_core.query_entries(
+                    keyword=kw.get().strip(),
+                    page=state["page"],
+                    page_size=state["page_size"],
+                )
             except Exception as e:
                 messagebox.showerror("错误", str(e), parent=win)
                 return
-            for e in hits:
-                tree.insert("", "end", values=(e.word, " ".join(e.pinyin)))
-            status.configure(text=f"显示 {len(hits)} 条" + ("（已截断）" if len(hits) >= 300 else ""))
+            state["page"] = r["page"]
+            for i, e in enumerate(r["items"]):
+                abs_i = r["page"] * r["page_size"] + i + 1
+                tree.insert(
+                    "",
+                    "end",
+                    values=(abs_i, e.word, " ".join(e.pinyin), e.jianpin_str.strip()),
+                )
+            dist = r["stats"].get("length_dist") or {}
+            dist_s = " ".join(f"{k}字:{v}" for k, v in sorted(dist.items()))
+            info.configure(
+                text=(
+                    f"词库 {r['total_all']} 条"
+                    + (f"｜筛选 {r['total']} 条" if r["keyword"] else "")
+                    + f"｜第 {r['page']+1}/{r['pages']} 页"
+                    + (f"｜{dist_s}" if dist_s else "")
+                )
+            )
+
+        def go_page(delta):
+            state["page"] = max(0, state["page"] + delta)
+            refresh()
+
+        def do_search(*_):
+            state["page"] = 0
+            refresh()
 
         def do_delete():
             sel = tree.selection()
             if not sel:
                 messagebox.showinfo("提示", "请先选中要删除的词条", parent=win)
                 return
-            words = [tree.item(i, "values")[0] for i in sel]
-            if not messagebox.askyesno("确认", f"删除 {len(words)} 条？会先自动备份。", parent=win):
+            words = [tree.item(i, "values")[1] for i in sel]
+            if not messagebox.askyesno(
+                "确认", f"删除 {len(words)} 条？会先自动备份。", parent=win
+            ):
                 return
-            self._run_async(lambda: app_core.delete_entries(words), "删除")
-            win.destroy()
 
-        tk.Button(bar, text="搜索", command=do_search, bg=PANEL, relief="groove",
-                  font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2").pack(side="left")
+            def work():
+                r = app_core.delete_entries(words)
+                return r
+
+            def after_del():
+                # 删除后刷新本窗口
+                self.after(300, refresh)
+                self.after(400, self.refresh_status)
+
+            self._run_async(work, "删除词条")
+            win.after(500, after_del)
+
+        def do_export_txt():
+            from tkinter import filedialog
+            dest = filedialog.asksaveasfilename(
+                parent=win,
+                title="导出当前筛选结果",
+                defaultextension=".txt",
+                initialfile="词库清单.txt",
+                filetypes=[("文本", "*.txt"), ("CSV", "*.csv"), ("所有文件", "*.*")],
+            )
+            if not dest:
+                return
+            try:
+                r = app_core.query_entries(keyword=kw.get().strip(), page=0, page_size=10**9)
+                items = r["items"]
+                with open(dest, "w", encoding="utf-8") as f:
+                    if dest.lower().endswith(".csv"):
+                        f.write("word,pinyin,jianpin\n")
+                        for e in items:
+                            f.write(
+                                f"{e.word},{' '.join(e.pinyin)},{e.jianpin_str.strip()}\n"
+                            )
+                    else:
+                        for e in items:
+                            f.write(f"{e.word}\t{' '.join(e.pinyin)}\n")
+                messagebox.showinfo("已导出", f"{len(items)} 条\n{dest}", parent=win)
+            except Exception as e:
+                messagebox.showerror("导出失败", str(e), parent=win)
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Button(
+            btns, text="搜索", command=do_search, bg=PANEL, relief="groove",
+            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
+        ).pack(side="left")
         kw.bind("<Return>", do_search)
-        tk.Button(bar, text="删除选中", command=do_delete, bg="#F5D6D6", relief="groove",
-                  font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2").pack(side="right")
-        do_search()
+        tk.Button(
+            btns, text="上一页", command=lambda: go_page(-1), bg=PANEL, relief="groove",
+            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
+        ).pack(side="left", padx=6)
+        tk.Button(
+            btns, text="下一页", command=lambda: go_page(1), bg=PANEL, relief="groove",
+            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
+        ).pack(side="left")
+        tk.Button(
+            btns, text="导出清单…", command=do_export_txt, bg=PANEL, relief="groove",
+            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
+        ).pack(side="left", padx=6)
+        tk.Button(
+            btns, text="删除选中", command=do_delete, bg="#F5D6D6", relief="groove",
+            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
+        ).pack(side="right")
+        tk.Button(
+            btns, text="刷新", command=refresh, bg=PANEL, relief="groove",
+            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
+        ).pack(side="right", padx=6)
+
+        refresh()
 
     def on_backup(self):
         def work():

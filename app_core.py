@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import threading
 from dataclasses import dataclass, field
@@ -365,21 +366,104 @@ def import_json_config(path: str, merge: bool = True) -> OperationResult:
     return import_pack(path, merge=merge)
 
 
-def search_entries(keyword: str = "", limit: int = 50) -> List[UdlEntry]:
-    """按词条子串搜索；若全是拼音字母则同时匹配拼音串/简拼"""
-    entries = load_entries()
-    kw = (keyword or "").strip()
+def _match_entry(entry: UdlEntry, kw: str) -> bool:
+    """增强匹配：词条子串、拼音连写/分音节、简拼。"""
     if not kw:
-        return entries[:limit]
-    hits = [e for e in entries if kw in e.word]
-    if not hits and kw.isascii() and kw.replace(" ", "").isalpha():
-        k = kw.lower().replace(" ", "")
-        for e in entries:
-            py_join = "".join(e.pinyin).lower()
-            jp = e.jianpin_str.strip().lower()
-            if k in py_join or (jp and (k.startswith(jp) or jp.startswith(k))):
-                hits.append(e)
-    return hits[:limit]
+        return True
+    if kw in entry.word:
+        return True
+    # 纯中文/含中文已用子串；拼音仅对 ascii 查询有意义
+    if not kw.isascii():
+        return False
+
+    k = kw.lower().replace(" ", "")
+    if not k:
+        return False
+
+    pys = [p for p in entry.pinyin if p]
+    py_join = "".join(pys).lower()
+    jp = entry.jianpin_str.strip().lower()
+
+    if k in py_join:
+        return True
+    if jp and (k == jp or (len(k) <= 3 and jp.startswith(k)) or (len(jp) >= 2 and k.startswith(jp))):
+        return True
+
+    # 分音节前缀：ming yue / mingyue
+    if len(k) >= 2:
+        # 连续音节拼接匹配
+        if py_join.startswith(k):
+            return True
+        # 每个查询片段都像音节前缀
+        parts = [p for p in re.split(r"[ '\-]", kw.lower()) if p]
+        if len(parts) >= 2:
+            idx = 0
+            ok = True
+            for part in parts:
+                found = False
+                while idx < len(pys):
+                    if pys[idx].lower().startswith(part):
+                        found = True
+                        idx += 1
+                        break
+                    idx += 1
+                if not found:
+                    ok = False
+                    break
+            if ok:
+                return True
+    return False
+
+
+def query_entries(
+    keyword: str = "",
+    page: int = 0,
+    page_size: int = 100,
+) -> dict:
+    """
+    分页查询词库。
+
+    返回 items / total（过滤后）/ total_all / page / pages / stats
+    """
+    ensure_ready()
+    entries = load_entries()
+    total_all = len(entries)
+    kw = (keyword or "").strip()
+
+    if kw:
+        filtered = [e for e in entries if _match_entry(e, kw)]
+    else:
+        filtered = entries
+
+    total = len(filtered)
+    page_size = max(1, int(page_size))
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(int(page), pages - 1))
+    start = page * page_size
+    items = filtered[start:start + page_size]
+
+    from collections import Counter
+    len_dist = Counter(len(e.word) for e in filtered)
+
+    return {
+        "items": items,
+        "total": total,
+        "total_all": total_all,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "keyword": kw,
+        "stats": {
+            "length_dist": dict(sorted(len_dist.items())),
+            "avg_len": (sum(len(e.word) for e in filtered) / total) if total else 0,
+        },
+    }
+
+
+def search_entries(keyword: str = "", limit: int = 50) -> List[UdlEntry]:
+    """兼容旧接口：增强搜索 + 截断。"""
+    result = query_entries(keyword=keyword, page=0, page_size=max(1, limit))
+    return list(result["items"])
 
 
 def delete_entries(words: Sequence[str]) -> OperationResult:
