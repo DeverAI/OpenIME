@@ -54,9 +54,11 @@ def run_cli(argv) -> int:
     p = sub.add_parser("delete", help="删除词条")
     p.add_argument("words", nargs="+")
 
-    p = sub.add_parser("query", help="搜索")
+    p = sub.add_parser("query", help="搜索/分页浏览")
     p.add_argument("-k", "--keyword", default="")
     p.add_argument("-l", "--limit", type=int, default=30)
+    p.add_argument("--page", type=int, default=0)
+    p.add_argument("--page-size", type=int, default=0, help="每页条数，默认用 --limit")
 
     sub.add_parser("status", help="状态")
     sub.add_parser("backup", help="备份")
@@ -122,10 +124,18 @@ def run_cli(argv) -> int:
     elif args.command == "delete":
         r = app_core.delete_entries(args.words)
     elif args.command == "query":
-        hits = app_core.search_entries(args.keyword, limit=args.limit)
-        print(f"共 {len(hits)} 条")
-        for e in hits:
-            print(f"  {e.word}  {' '.join(e.pinyin)}")
+        r = app_core.query_entries(
+            keyword=args.keyword,
+            page=args.page,
+            page_size=args.page_size or args.limit,
+        )
+        print(
+            f"词库 {r['total_all']} 条"
+            + (f"，筛选 {r['total']} 条" if r["keyword"] else "")
+            + f"，第 {r['page']+1}/{r['pages']} 页"
+        )
+        for e in r["items"]:
+            print(f"  {e.word}  {' '.join(e.pinyin)}  [{e.jianpin_str.strip()}]")
         return 0
     elif args.command == "status":
         s = app_core.status_summary()

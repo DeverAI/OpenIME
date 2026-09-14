@@ -58,6 +58,7 @@ OpenIME/
 python test_header_preserve.py
 python test_logic_expected.py
 python test_general_flow.py
+python test_query_page.py
 ```
 使用临时 APPDATA，不碰真实词库。改 UDL/拼音表/抽词后必须全过。
 真机文件头对照与风险见 `docs/检修记录.md`。
