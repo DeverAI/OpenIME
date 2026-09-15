@@ -8,8 +8,7 @@
 from __future__ import annotations
 
 import re
-from collections import Counter
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List
 
 MAX_WORD_LEN = 12
 MIN_WORD_LEN = 2
@@ -21,11 +20,6 @@ _LINE_SPLIT = re.compile(r"[\r\n]+")
 # 句读切分：中英标点
 _SENT_SPLIT = re.compile(r"[，。！？；：、,!?;:\s—…·「」『』【】（）()\[\]{}<>《》\"'\"]+")
 
-_STOP_SINGLE = set(
-    "的了和是在有我不这为之以而其于上下来个们地中到说得出也那得着"
-    "与及或等被把让给从向对很能会可但若因所以则且又并再就只都还很"
-    "theandanorofinonattoitis"  # 极短英文虚词按整词再滤
-)
 _STOP_WORDS = {
     "一个", "我们", "你们", "他们", "这个", "那个", "可以", "什么", "怎么",
     "因为", "所以", "但是", "如果", "然后", "已经", "没有", "不是", "就是",
@@ -73,9 +67,13 @@ def looks_like_term(s: str) -> bool:
     if len(compact) < MIN_WORD_LEN:
         return False
 
-    # 纯英文/数字术语（可含 + - _ . /）
+    # 基本平面外的字符（UTF-16 代理对）写不进 UDL 的 60 字节结构，直接拒
+    if any(ord(ch) > 0xFFFF for ch in compact):
+        return False
+
+    # 纯英文/数字术语（可含 + - _ . /）；UDL 单条上限 12 字，超长必被截断，直接拒
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_+\-./]*", s2):
-        if len(s2) > MAX_WORD_LEN * 2:
+        if len(s2) > MAX_WORD_LEN:
             return False
         if s2.lower() in _STOP_WORDS:
             return False
@@ -118,9 +116,9 @@ def extract_from_lines(text: str) -> List[str]:
             if len(words) > 1:
                 for w in words:
                     _push(out, seen, w)
-                # 也收一个无空格拼接形态（便于整词联想）
+                # 也收一个无空格拼接形态（便于整词联想）；超过 12 字写不进，不收
                 joined = "".join(words)
-                if len(joined) <= MAX_WORD_LEN * 2:
+                if len(joined) <= MAX_WORD_LEN:
                     _push(out, seen, joined)
                 continue
         parts = re.split(r"[、，,;；|/]+", line)
@@ -239,17 +237,3 @@ def extract(
     result = extract_auto(text, include_latin=include_latin)
     result["stats"]["mode"] = "auto"
     return result
-
-
-def term_frequency(text: str, top: int = 40) -> List[Tuple[str, int]]:
-    """粗频次，便于预览哪些词在反复出现（2–4 字滑窗，仅诊断用）"""
-    compact = re.sub(r"[^一-鿿A-Za-z0-9]", "", text)
-    c: Counter = Counter()
-    for n in (2, 3, 4):
-        for i in range(0, max(0, len(compact) - n + 1)):
-            w = compact[i:i + n]
-            if mostly_cjk(w) or w.isascii():
-                c[w] += 1
-    # 过滤单次且含停用倾向的
-    items = [(w, n) for w, n in c.most_common(top * 3) if n >= 2 and w not in _STOP_WORDS]
-    return items[:top]

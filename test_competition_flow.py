@@ -78,7 +78,8 @@ udl = UdlFile()
 entries = udl.read(path)
 assert len(entries) == data["entry_count"]
 sample = [e for e in entries if e.word == "床前明月光"]
-assert sample and sample[0].pinyin[0] in ("chuang", "ch", "c") or sample[0].pinyin
+assert sample, "床前明月光 未写回词库"
+assert sample[0].pinyin and sample[0].pinyin[0] == "chuang", sample[0].pinyin
 print("sample entry:", sample[0].word, sample[0].pinyin, sample[0].jianpin_str)
 
 # 10) 删除

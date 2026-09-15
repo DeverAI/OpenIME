@@ -7,13 +7,14 @@ OpenIME · 微软拼音词库管家（通用垂域适配）
 from __future__ import annotations
 
 import os
+import csv
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
 
 import app_core
-from paths import user_data_dir
+from paths import resource_path
 
 
 BG = "#F3F1EC"
@@ -26,10 +27,11 @@ BTN_FG = "#FFFFFF"
 BORDER = "#D5D0C6"
 
 FILE_TYPES = [
-    ("支持的文档", "*.txt *.md *.csv *.tsv *.log *.pdf *.docx *.json"),
+    ("支持的文档", "*.txt *.md *.csv *.tsv *.log *.pdf *.docx"),
     ("文本", "*.txt *.md *.csv *.tsv *.log"),
     ("PDF", "*.pdf"),
     ("Word", "*.docx"),
+    ("词库包 JSON", "*.json"),
     ("所有文件", "*.*"),
 ]
 
@@ -38,6 +40,13 @@ MODE_LABELS = [
     ("lines", "一行一个术语 / 顿号列表"),
     ("sentences", "按标点抽短语"),
     ("poetry", "古诗文整句+节奏组（可选）"),
+]
+
+BUILTIN_PACKS = [
+    ("数学", "词库包_初三数学.txt"),
+    ("物理", "词库包_初三物理.txt"),
+    ("化学", "词库包_初三化学.txt"),
+    ("古诗文", "词库包_古诗文比赛.txt"),
 ]
 
 
@@ -107,6 +116,18 @@ class App(tk.Tk):
             bg=PANEL, font=("Microsoft YaHei UI", 10),
         ).pack(side="left", padx=12)
 
+        # 内置词库包
+        boxp = ttk.LabelFrame(self, text=" 内置词库包（一键导入） ", style="Box.TLabelframe")
+        boxp.pack(fill="x", padx=18, pady=4)
+        rowp = ttk.Frame(boxp, style="Card.TFrame")
+        rowp.pack(fill="x", padx=10, pady=6)
+        ttk.Label(rowp, text="初三样例：", style="Card.TLabel").pack(side="left")
+        for label, fname in BUILTIN_PACKS:
+            self._btn(
+                rowp, label,
+                lambda f=fname, lb=label: self.on_quick_pack(f, lb),
+            ).pack(side="left", padx=(0, 6))
+
         # 管理区
         box2 = ttk.LabelFrame(self, text=" 管理 ", style="Box.TLabelframe")
         box2.pack(fill="x", padx=18, pady=4)
@@ -116,7 +137,14 @@ class App(tk.Tk):
         self._btn(row3, "备份", self.on_backup, False).pack(side="left", expand=True, fill="x", padx=6)
         self._btn(row3, "恢复…", self.on_restore, False).pack(side="left", expand=True, fill="x", padx=6)
         self._btn(row3, "导出词库包", self.on_export, False).pack(side="left", expand=True, fill="x", padx=6)
-        self._btn(row3, "导入词库包…", self.on_import_pack, False).pack(side="left", expand=True, fill="x", padx=(6, 0))
+        self._btn(row3, "导入词库包…", self.on_import_pack, False).pack(side="left", expand=True, fill="x", padx=6)
+        self._btn(row3, "撤销上次导入", self.on_undo, False).pack(side="left", expand=True, fill="x", padx=(6, 0))
+        row4 = ttk.Frame(box2, style="Card.TFrame")
+        row4.pack(fill="x", padx=10, pady=(0, 8))
+        self._btn(row4, "历史…", self.on_history, False).pack(side="left", padx=(0, 6))
+        ttk.Label(
+            row4, text="查看最近写入记录（导入 / 删除 / 替换 / 改拼音 / 恢复）", style="Card.TLabel",
+        ).pack(side="left")
 
         # 状态
         st = ttk.LabelFrame(self, text=" 状态 ", style="Box.TLabelframe")
@@ -206,7 +234,7 @@ class App(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _run_async(self, fn, title="完成"):
+    def _run_async(self, fn, title="完成", on_done=None):
         if self._busy:
             return
         self.set_busy(True, "处理中…")
@@ -224,11 +252,18 @@ class App(tk.Tk):
                     self.append_log(f"✓ {title}：{result.message}")
                     if result.detail:
                         self.append_log(result.detail)
-                    messagebox.showinfo(title, msg)
                 else:
                     self.append_log(f"✗ {result.message}")
                     if result.detail:
                         self.append_log(result.detail)
+                if on_done:
+                    try:
+                        on_done(result)
+                    except Exception as e:
+                        self.append_log(f"回调出错：{e}")
+                if result.ok:
+                    messagebox.showinfo(title, msg)
+                else:
                     messagebox.showwarning("未能完成", msg)
                 self.refresh_status()
 
@@ -295,12 +330,48 @@ class App(tk.Tk):
 
     # ---------- actions ----------
     def on_pick_files(self):
-        paths = filedialog.askopenfilenames(parent=self, title="选择文档", filetypes=FILE_TYPES)
+        paths = list(filedialog.askopenfilenames(parent=self, title="选择文档", filetypes=FILE_TYPES))
         if not paths:
             return
-        paths = list(paths)
-        mode = self._mode_id()
-        latin = self.latin_var.get()
+        packs = [p for p in paths if p.lower().endswith(".json")]
+        docs = [p for p in paths if not p.lower().endswith(".json")]
+        if packs and docs:
+            messagebox.showinfo(
+                "同时选了词库包和文档",
+                "JSON 是词库包格式，会按「导入词库包」处理；\n其余文件按文档导入（会弹预览）。\n\n如需分开处理，请分两次选择。",
+            )
+        if docs and packs:
+            self._import_flow(
+                docs, self._mode_id(), self.latin_var.get(), "导入文档",
+                then=lambda: self._import_packs_flow(packs),
+            )
+        elif docs:
+            self._import_flow(docs, self._mode_id(), self.latin_var.get(), "导入文档")
+        elif packs:
+            self._import_packs_flow(packs)
+
+    def on_quick_pack(self, fname: str, label: str):
+        if self._busy:
+            return
+        path = resource_path(fname)
+        if not os.path.exists(path):
+            messagebox.showinfo(
+                "没有找到内置词库包",
+                f"未找到 {fname}。\n源码目录或打包资源里不存在这个文件。",
+            )
+            return
+        self._import_flow([path], mode="lines", latin=False, title=f"词库包·{label}")
+
+    def on_undo(self):
+        def work():
+            return app_core.undo_last_import()
+
+        self._run_async(work, "撤销上次导入")
+
+    def _import_flow(self, paths: List[str], mode: str, latin: bool, title: str, then=None):
+        """读取文档 → 抽词 → 预览确认 → 写入。then：整条流程结束后（含取消/无词条）再执行。"""
+        if self._busy:
+            return
 
         def work():
             from document_loader import load_many
@@ -321,38 +392,38 @@ class App(tk.Tk):
                 desc += "\n" + "\n".join(errors)
             return terms, desc
 
-        def pipeline():
-            if self._busy:
-                return app_core.OperationResult(False, "忙，请稍候")
-            self.set_busy(True, "正在读取文档…")
+        self.set_busy(True, "正在读取文档…")
 
-            def stage1():
-                try:
-                    terms, desc = work()
-                except Exception as e:
-                    self.after(0, lambda: self._fail_busy(str(e)))
+        def stage1():
+            try:
+                terms, desc = work()
+            except Exception as e:
+                self.after(0, lambda: self._fail_busy(str(e)))
+                return
+
+            def stage2():
+                self.set_busy(False)
+                if not terms:
+                    messagebox.showwarning("没有词条", "未能从文件抽出有效词条。可试试「一行一个术语」模式。")
+                    self.refresh_status()
+                    if then:
+                        then()
                     return
+                picked = self._confirm_preview(terms, desc)
+                if not picked:
+                    self.append_log("已取消导入")
+                    if then:
+                        then()
+                    return
+                self._run_async(
+                    lambda: app_core.apply_tokens(picked, source_desc=desc),
+                    title,
+                    on_done=(lambda _r: then()) if then else None,
+                )
 
-                def stage2():
-                    self.set_busy(False)
-                    if not terms:
-                        messagebox.showwarning("没有词条", "未能从文件抽出有效词条。可试试「一行一个术语」模式。")
-                        self.refresh_status()
-                        return
-                    picked = self._confirm_preview(terms, desc)
-                    if not picked:
-                        self.append_log("已取消导入")
-                        return
-                    self._run_async(
-                        lambda: app_core.apply_tokens(picked, source_desc=desc),
-                        "导入文档",
-                    )
+            self.after(0, stage2)
 
-                self.after(0, stage2)
-
-            threading.Thread(target=stage1, daemon=True).start()
-
-        pipeline()
+        threading.Thread(target=stage1, daemon=True).start()
 
     def _fail_busy(self, err: str):
         self.set_busy(False)
@@ -523,16 +594,17 @@ class App(tk.Tk):
                 return
 
             def work():
-                r = app_core.delete_entries(words)
-                return r
+                return app_core.delete_entries(words)
 
-            def after_del():
-                # 删除后刷新本窗口
-                self.after(300, refresh)
-                self.after(400, self.refresh_status)
+            def after_done(_r):
+                # 删除真正写完后才刷新，避免固定延时和写入竞速
+                try:
+                    refresh()
+                except Exception:
+                    pass
+                self.refresh_status()
 
-            self._run_async(work, "删除词条")
-            win.after(500, after_del)
+            self._run_async(work, "删除词条", on_done=after_done)
 
         def do_export_txt():
             from tkinter import filedialog
@@ -548,14 +620,14 @@ class App(tk.Tk):
             try:
                 r = app_core.query_entries(keyword=kw.get().strip(), page=0, page_size=10**9)
                 items = r["items"]
-                with open(dest, "w", encoding="utf-8") as f:
-                    if dest.lower().endswith(".csv"):
-                        f.write("word,pinyin,jianpin\n")
+                if dest.lower().endswith(".csv"):
+                    with open(dest, "w", encoding="utf-8-sig", newline="") as f:
+                        w = csv.writer(f)
+                        w.writerow(["词条", "拼音", "简拼"])
                         for e in items:
-                            f.write(
-                                f"{e.word},{' '.join(e.pinyin)},{e.jianpin_str.strip()}\n"
-                            )
-                    else:
+                            w.writerow([e.word, " ".join(e.pinyin), e.jianpin_str.strip()])
+                else:
+                    with open(dest, "w", encoding="utf-8") as f:
                         for e in items:
                             f.write(f"{e.word}\t{' '.join(e.pinyin)}\n")
                 messagebox.showinfo("已导出", f"{len(items)} 条\n{dest}", parent=win)
@@ -582,6 +654,11 @@ class App(tk.Tk):
             font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
         ).pack(side="left", padx=6)
         tk.Button(
+            btns, text="改拼音", command=lambda: self._edit_pinyin_dialog(tree, win, refresh),
+            bg=PANEL, relief="groove",
+            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
+        ).pack(side="left")
+        tk.Button(
             btns, text="删除选中", command=do_delete, bg="#F5D6D6", relief="groove",
             font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
         ).pack(side="right")
@@ -591,6 +668,47 @@ class App(tk.Tk):
         ).pack(side="right", padx=6)
 
         refresh()
+
+    def _edit_pinyin_dialog(self, tree, parent_win, refresh):
+        sel = tree.selection()
+        if len(sel) != 1:
+            messagebox.showinfo("提示", "请先选中一条词条（一次只改一条）", parent=parent_win)
+            return
+        values = tree.item(sel[0], "values")
+        word = values[1]
+        current = values[2] if len(values) > 2 else ""
+
+        win = tk.Toplevel(parent_win)
+        win.title(f"修改拼音：{word}")
+        win.configure(bg=BG)
+        win.geometry("440x210")
+        win.transient(parent_win)
+        win.grab_set()
+        ttk.Label(win, text=f"词条「{word}」", style="TLabel").pack(anchor="w", padx=14, pady=(12, 2))
+        ttk.Label(
+            win,
+            text="按字给音节，空格分隔。不够的字留空，该字不参与拼音联想。",
+            style="Sub.TLabel",
+        ).pack(anchor="w", padx=14)
+        entry = tk.Entry(win, font=("Microsoft YaHei UI", 12), width=34)
+        entry.pack(fill="x", padx=14, pady=8)
+        entry.insert(0, " ".join(current.split()))
+        entry.focus_set()
+
+        def do_ok(*_):
+            val = entry.get().strip()
+            win.destroy()
+            self._run_async(
+                lambda: app_core.update_entry_pinyin(word, val),
+                "修改拼音",
+                on_done=lambda _r: refresh(),
+            )
+
+        win.bind("<Return>", do_ok)
+        tk.Button(
+            win, text="保存", command=do_ok, bg=BTN_BG, fg=BTN_FG, relief="flat",
+            font=("Microsoft YaHei UI", 11, "bold"), padx=14, pady=6, cursor="hand2",
+        ).pack(pady=6)
 
     def on_backup(self):
         def work():
@@ -643,6 +761,27 @@ class App(tk.Tk):
             return
         self._run_async(lambda: app_core.export_pack(dest), "导出")
 
+    def _import_packs_flow(self, packs: List[str]):
+        merge = messagebox.askyesno(
+            "导入方式",
+            "是否合并到现有词库？\n\n是 = 合并（推荐）\n否 = 替换现有全部词条",
+            parent=self,
+        )
+        self._run_async(lambda: self._import_packs(packs, merge), "导入词库包")
+
+    def _import_packs(self, packs: List[str], merge: bool) -> app_core.OperationResult:
+        ok = True
+        lines: List[str] = []
+        for p in packs:
+            r = app_core.import_pack(p, merge=merge)
+            ok = ok and r.ok
+            lines.append(f"{os.path.basename(p)}：{r.message}" + (f"\n{r.detail}" if r.detail else ""))
+        return app_core.OperationResult(
+            ok,
+            f"已处理 {len(packs)} 个词库包" + ("" if ok else "（部分失败，见详情）"),
+            detail="\n\n".join(lines),
+        )
+
     def on_import_pack(self):
         p = filedialog.askopenfilename(
             parent=self, title="导入词库包",
@@ -650,12 +789,81 @@ class App(tk.Tk):
         )
         if not p:
             return
-        merge = messagebox.askyesno(
-            "导入方式",
-            "是否合并到现有词库？\n\n是 = 合并（推荐）\n否 = 替换现有全部词条",
-            parent=self,
+        self._import_packs_flow([p])
+
+    def on_history(self):
+        recs = app_core.list_history()
+        win = tk.Toplevel(self)
+        win.title("操作历史")
+        win.configure(bg=BG)
+        win.geometry("720x420")
+        win.minsize(620, 360)
+        win.transient(self)
+        win.grab_set()
+        ttk.Label(
+            win,
+            text="最近 200 条写入记录（新的在前）。「撤销上次导入」只删最近一次导入新增的词。",
+            style="Sub.TLabel",
+        ).pack(anchor="w", padx=14, pady=(10, 4))
+
+        mid = ttk.Frame(win)
+        mid.pack(fill="both", expand=True, padx=12, pady=4)
+        tree = ttk.Treeview(
+            mid, columns=("time", "action", "what", "source"), show="headings", height=14,
         )
-        self._run_async(lambda: app_core.import_pack(p, merge=merge), "导入词库包")
+        tree.heading("time", text="时间")
+        tree.heading("action", text="操作")
+        tree.heading("what", text="内容")
+        tree.heading("source", text="来源")
+        tree.column("time", width=145)
+        tree.column("action", width=70, anchor="center")
+        tree.column("what", width=270)
+        tree.column("source", width=185)
+        vsb = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        action_names = {"import": "导入", "delete": "删除", "replace": "替换", "edit": "改拼音", "restore": "恢复"}
+
+        def fill():
+            tree.delete(*tree.get_children())
+            for rec in recs:
+                action = rec.get("action", "?")
+                if action == "import":
+                    words = rec.get("added") or []
+                    what = f"+{len(words)} 条 " + "、".join(words[:3]) + ("…" if len(words) > 3 else "")
+                elif action == "delete":
+                    words = rec.get("removed") or []
+                    what = f"-{len(words)} 条 " + "、".join(words[:3]) + ("…" if len(words) > 3 else "")
+                elif action == "replace":
+                    words = rec.get("added") or []
+                    what = f"替换为 {len(words)} 条"
+                else:
+                    what = ""
+                src_lines = (rec.get("source") or "").splitlines()
+                src = src_lines[0] if src_lines else ""
+                tree.insert(
+                    "", "end",
+                    values=(rec.get("time", "?"), action_names.get(action, action), what, src),
+                )
+
+        def do_refresh():
+            nonlocal recs
+            recs = app_core.list_history()
+            fill()
+
+        bottom = ttk.Frame(win)
+        bottom.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Button(
+            bottom, text="刷新", command=do_refresh, bg=PANEL, relief="groove",
+            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
+        ).pack(side="left")
+        tk.Button(
+            bottom, text="关闭", command=win.destroy, bg=PANEL, relief="groove",
+            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
+        ).pack(side="right")
+        fill()
 
 
 def run_gui():

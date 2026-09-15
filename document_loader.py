@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 
-SUPPORTED_EXT = {".txt", ".md", ".csv", ".tsv", ".log", ".pdf", ".docx", ".json"}
+SUPPORTED_EXT = {".txt", ".md", ".csv", ".tsv", ".log", ".pdf", ".docx"}
 
 
 @dataclass
@@ -75,21 +75,24 @@ def load_docx(path: str) -> LoadedDoc:
 
 def load_pdf(path: str) -> LoadedDoc:
     # 优先 PyMuPDF（抽取质量更好），其次 pypdf
+    warn = ""
     try:
         import fitz  # type: ignore
         doc = fitz.open(path)
-        parts = []
-        for page in doc:
-            parts.append(page.get_text("text"))
-        doc.close()
+        try:
+            parts = []
+            for page in doc:
+                parts.append(page.get_text("text"))
+        finally:
+            doc.close()
         text = "\n".join(parts)
-        return LoadedDoc(path=path, text=text, kind="pdf", pages_or_lines=len(parts))
+        if not text.strip():
+            warn = "未提取到任何文本：可能是扫描版 PDF，需要先 OCR。"
+        return LoadedDoc(path=path, text=text, kind="pdf", pages_or_lines=len(parts), warning=warn)
     except ImportError:
         pass
     except Exception as e:
         warn = f"PyMuPDF 读取异常，尝试 pypdf：{e}"
-    else:
-        warn = ""
 
     try:
         from pypdf import PdfReader
@@ -98,6 +101,8 @@ def load_pdf(path: str) -> LoadedDoc:
         for page in reader.pages:
             parts.append(page.extract_text() or "")
         text = "\n".join(parts)
+        if not text.strip() and not warn:
+            warn = "未提取到任何文本：可能是扫描版 PDF，需要先 OCR。"
         return LoadedDoc(path=path, text=text, kind="pdf", pages_or_lines=len(parts), warning=warn)
     except ImportError:
         raise RuntimeError(
@@ -116,6 +121,11 @@ def load_document(path: str) -> LoadedDoc:
         return load_pdf(path)
     if ext == ".docx":
         return load_docx(path)
+    if ext == ".json":
+        raise RuntimeError(
+            ".json 是 OpenIME 词库包格式，不是普通文档。\n"
+            "请用「导入词库包…」（GUI）或 import-pack（CLI）导入。"
+        )
     if ext == ".doc":
         raise RuntimeError(
             "暂不支持旧版 .doc。\n请用 Word 打开后另存为 .docx，或导出为 .txt 再导入。"

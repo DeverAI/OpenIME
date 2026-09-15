@@ -17,7 +17,8 @@ def resource_path(name: str) -> str:
 
 
 def user_data_dir() -> str:
-    """可写目录：备份、导出默认位置"""
-    d = os.path.join(os.environ.get("APPDATA", app_dir()), "OpenIME")
+    """可写目录：备份、导出默认位置。APPDATA 为空时退回应用目录，绝不写相对路径。"""
+    appdata = os.environ.get("APPDATA") or app_dir()
+    d = os.path.join(appdata, "OpenIME")
     os.makedirs(d, exist_ok=True)
     return d

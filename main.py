@@ -37,6 +37,8 @@ def run_cli(argv) -> int:
   OpenIME.exe query -k 产品
   OpenIME.exe export -o pack.json
   OpenIME.exe import-pack -c pack.json
+  OpenIME.exe undo                        # 撤销最近一次导入
+  OpenIME.exe history                     # 查看操作历史
         """,
     )
     sub = parser.add_subparsers(dest="command")
@@ -62,6 +64,8 @@ def run_cli(argv) -> int:
 
     sub.add_parser("status", help="状态")
     sub.add_parser("backup", help="备份")
+    sub.add_parser("undo", help="撤销最近一次导入（删除那批词条）")
+    sub.add_parser("history", help="查看导入/删除/替换历史")
 
     p = sub.add_parser("restore", help="恢复备份")
     p.add_argument("path")
@@ -144,6 +148,25 @@ def run_cli(argv) -> int:
         print(f"当前词条: {s['count']}")
         print(f"备份份数: {s['backups']}")
         print(f"支持格式: {s['supported']}")
+        return 0
+    elif args.command == "undo":
+        r = app_core.undo_last_import()
+    elif args.command == "history":
+        recs = app_core.list_history()
+        if not recs:
+            print("暂无历史记录")
+            return 0
+        for rec in recs[:30]:
+            action = rec.get("action", "?")
+            extra = {
+                "import": f"新增 {len(rec.get('added') or [])} 条",
+                "delete": f"删除 {len(rec.get('removed') or [])} 条",
+                "replace": f"替换为 {len(rec.get('added') or [])} 条",
+                "edit": "修改拼音",
+                "restore": "恢复备份",
+            }.get(action, "")
+            src = (rec.get("source") or "").splitlines()[0]
+            print(f"{rec.get('time', '?')}  {action:<8} {extra:<14} {src}")
         return 0
     elif args.command == "backup":
         path = app_core.backup_udl("cli")

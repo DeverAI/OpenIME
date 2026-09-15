@@ -2,7 +2,7 @@
 打包：双击即用的通用词库管家
 输出: dist/OpenIME词库管家.exe
 
-说明：打包只带 pypdf + python-docx，控制体积。
+说明：打包只带 pypdf + python-docx 控制体积，同时内置拼音表与学科词库包。
 源码环境若装了 pymupdf，PDF 中文抽取会优先用它（体验更好）。
 """
 
@@ -14,6 +14,14 @@ import sys
 def build():
     print("=== 打包 OpenIME 词库管家 ===")
     name = "OpenIME词库管家"
+    # 需要打进 exe 的资源：拼音表 + 内置词库包
+    resources = [
+        "pinyin_table.json",
+        "词库包_初三数学.txt",
+        "词库包_初三物理.txt",
+        "词库包_初三化学.txt",
+        "词库包_古诗文比赛.txt",
+    ]
     args = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
@@ -21,7 +29,6 @@ def build():
         "--name", name,
         "--clean",
         "--noconfirm",
-        "--add-data=pinyin_table.json:.",
         "--hidden-import", "pypinyin",
         "--hidden-import", "pypinyin.constants",
         "--hidden-import", "pypinyin.style",
@@ -48,6 +55,9 @@ def build():
         "--exclude-module", "setuptools",
         "main.py",
     ]
+    for res in resources:
+        # Windows 下 --add-data 的分隔符是 os.pathsep（;），Linux/macOS 是 :
+        args.append(f"--add-data={res}{os.pathsep}.")
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"

@@ -15,6 +15,7 @@ dist/
 *.log
 *.bak
 *.tmp
+pinyin_output.txt
 .DS_Store
 Thumbs.db
 

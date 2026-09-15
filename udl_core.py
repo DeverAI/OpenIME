@@ -35,22 +35,6 @@ class UdlEntry:
     pinyin: List[str] = field(default_factory=list)  # 拼音列表
     insert_timestamp: int = 0                   # 插入时间戳
     jianpin: bytes = b'\x00\x00\x00'            # 简拼 (3 bytes)
-    frequency: int = 1                          # 频率
-
-    @property
-    def word_length(self) -> int:
-        return len(self.word)
-
-    @property
-    def pinyin_indices(self) -> List[int]:
-        """获取拼音索引列表 (用于写入)；空/未知用哨兵，不用 0"""
-        out = []
-        for py in self.pinyin:
-            if not py:
-                out.append(UNKNOWN_PY_INDEX)
-            else:
-                out.append(get_index_by_pinyin(py))
-        return out
 
     @property
     def jianpin_str(self) -> str:
@@ -218,8 +202,12 @@ class UdlFile:
             header[4:8] = UDL_SIZE_SETTINGS
             header[8:12] = UDL_VALIDATION
 
-        # 写入词条数 (offset 0xC)
-        struct.pack_into('<I', header, 0xC, len(self.entries))
+        # 写入词条数 (offset 0xC)。空词条/含基本平面外字符的词条不写入，也不计数（回读时读不到）。
+        payload_entries = [
+            e for e in self.entries
+            if e and (e.word or '').strip() and not any(ord(ch) > 0xFFFF for ch in e.word or '')
+        ]
+        struct.pack_into('<I', header, 0xC, len(payload_entries))
 
         # 写入导出时间戳 (offset 0x14)
         export_ts = int(datetime.now().timestamp())
@@ -227,17 +215,42 @@ class UdlFile:
 
         # 构建数据区
         data_area = bytearray()
-        for entry in self.entries:
-            entry_bytes = self._build_entry(entry)
-            data_area.extend(entry_bytes)
+        for entry in payload_entries:
+            data_area.extend(self._build_entry(entry))
 
-        # 写入文件
+        # 原子写入：先写同目录临时文件 → 回读校验 → os.replace 替换。
+        # 直接覆盖目标文件时，写一半崩溃会留下半个坏词库。
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(path, 'wb') as f:
-            f.write(header)
-            f.write(data_area)
+        tmp_path = f"{path}.{os.getpid()}.tmp_openime"
+        try:
+            with open(tmp_path, 'wb') as f:
+                f.write(header)
+                f.write(data_area)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # 回读校验：条数 + 逐条 word 一致才算写成功
+            check = UdlFile()
+            read_back = check.read(tmp_path)
+            if len(read_back) != len(payload_entries):
+                raise IOError(
+                    f"回读校验失败：写入 {len(payload_entries)} 条，读回 {len(read_back)} 条"
+                )
+            for a, b in zip(payload_entries, read_back):
+                # _build_entry 会把超长词截到 12 字，按截断后的形态对比
+                if (a.word or '')[:MAX_WORD_LEN] != b.word:
+                    raise IOError(f"回读校验失败：词条不一致（{a.word!r} ≠ {b.word!r}）")
+
+            os.replace(tmp_path, path)
+        finally:
+            # 成功 replace 后 tmp 已不存在；失败时清理残留
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _build_entry(self, entry: UdlEntry) -> bytes:
         """构建单个词条 (60 bytes)。超长词会被截断，避免写坏相邻词条。"""
@@ -313,9 +326,11 @@ class UdlFile:
         return ''.join(letters[:3]).encode('ascii', errors='ignore')
 
     def add_entry(self, word: str, pinyin: List[str] = None):
-        """添加词条（自动限制在 2–12 字）"""
+        """添加词条（自动限制在 2–12 字；拒绝基本平面外字符，那种词写不进 60 字节结构）"""
         word = (word or '').strip()
         if not word or len(word) < 2 or len(word) > MAX_WORD_LEN:
+            return
+        if any(ord(ch) > 0xFFFF for ch in word):
             return
         if pinyin is None:
             pinyin = self._guess_pinyin(word)
@@ -341,28 +356,21 @@ class UdlFile:
     def _guess_pinyin(self, word: str) -> List[str]:
         """
         猜测拼音。
-        - 汉字：pypinyin
+        - 汉字：pypinyin 逐字取音。pypinyin 会把连续非汉字并成一段返回，
+          按段对齐会让后面的汉字错位（如 "AI助手" 的「助」会拿到「手」的音）。
         - 拉丁/数字：保留空字符串占位（写入时用哨兵索引，不伪装成 a）
         """
         try:
             from pypinyin import pinyin, Style
-            # errors='ignore' 会丢掉非汉字，必须用 default 再按字符对齐
-            py_list = pinyin(word, style=Style.NORMAL, errors='default')
-            out = []
-            for i, item in enumerate(py_list):
-                if i >= len(word):
-                    break
-                ch = word[i]
-                if not item:
-                    out.append('')
-                elif not ('一' <= ch <= '鿿' or '㐀' <= ch <= '䶿'):
+            out: List[str] = []
+            for ch in word:
+                if not ('一' <= ch <= '鿿' or '㐀' <= ch <= '䶿'):
                     # 非汉字不套拼音
                     out.append('')
-                else:
-                    out.append(item[0] if item else '')
-            if len(out) < len(word):
-                out.extend([''] * (len(word) - len(out)))
-            return out[:len(word)]
+                    continue
+                py = pinyin(ch, style=Style.NORMAL, errors='default')
+                out.append(py[0][0] if py and py[0] else '')
+            return out
         except ImportError:
             return [''] * len(word)
 
@@ -384,6 +392,8 @@ class UdlFile:
         for item in items:
             word = str(item.get('word') or item.get('text') or '').strip()
             if not word or len(word) < 2 or len(word) > MAX_WORD_LEN:
+                continue
+            if any(ord(ch) > 0xFFFF for ch in word):
                 continue
             pinyin = item.get('pinyin') or []
             if isinstance(pinyin, str):

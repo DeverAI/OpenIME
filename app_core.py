@@ -23,6 +23,126 @@ from paths import user_data_dir
 # 串行化所有写 UDL 的操作，避免 GUI 多线程并发写坏文件
 _WRITE_LOCK = threading.RLock()
 
+# 词库解析缓存：按 (mtime_ns, size) 失效，避免 status/preview/query 反复全量解析
+_ENTRIES_CACHE: dict = {"key": None, "path": None, "entries": []}
+
+
+def _cache_invalidate():
+    _ENTRIES_CACHE["key"] = None
+    _ENTRIES_CACHE["path"] = None
+    _ENTRIES_CACHE["entries"] = []
+
+
+# ---------- 导入历史（manifest + 撤销） ----------
+
+HISTORY_KEEP = 200
+
+
+def _history_dir() -> str:
+    d = os.path.join(user_data_dir(), "history")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _record_history(
+    action: str,
+    source_desc: str = "",
+    added: Optional[Sequence[str]] = None,
+    removed: Optional[Sequence[str]] = None,
+    total: Optional[int] = None,
+    backup: str = "",
+):
+    """每次写入成功后记一条 manifest。历史记录失败绝不影响主流程。"""
+    try:
+        rec = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "action": action,
+            "source": source_desc or "",
+            "added": list(added or []),
+            "removed": list(removed or []),
+            "total": total,
+            "backup": backup or "",
+        }
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join(_history_dir(), f"{ts}_{action}")
+        path = base + ".json"
+        n = 2
+        while os.path.exists(path):
+            path = f"{base}_{n}.json"
+            n += 1
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=2)
+        # 只保留最近 HISTORY_KEEP 份（按 mtime 排序，勿按文件名——同秒 _N 后缀是字典序陷阱）
+        files = _history_files()
+        for old in files[HISTORY_KEEP:]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def _history_files() -> List[str]:
+    """history 目录下全部 manifest 路径，新的在前。
+
+    排序必须按文件 mtime：文件名里的同秒冲突后缀是字典序陷阱
+    （import_9 > import_10），按名倒序会把"最近一次导入"取错。
+    """
+    d = _history_dir()
+    out: List[tuple] = []
+    for fn in os.listdir(d):
+        if not fn.endswith(".json"):
+            continue
+        p = os.path.join(d, fn)
+        try:
+            out.append((os.path.getmtime(p), fn, p))
+        except OSError:
+            continue
+    out.sort(reverse=True)
+    return [p for _, _, p in out]
+
+
+def list_history() -> List[dict]:
+    """最近的操作记录，新的在前。"""
+    out: List[dict] = []
+    for path in _history_files():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                rec = json.load(f)
+            rec["_file"] = path
+            out.append(rec)
+        except Exception:
+            continue
+    return out
+
+
+def undo_last_import() -> OperationResult:
+    """撤销最近一次导入：精确删除那批新增词条（其余词条不动）。"""
+    recs = [r for r in list_history() if r.get("action") == "import"]
+    if not recs:
+        return OperationResult(False, "没有可撤销的导入记录")
+    rec = recs[0]
+    words = [w for w in (rec.get("added") or []) if w]
+    if not words:
+        try:
+            os.remove(rec["_file"])
+        except OSError:
+            pass
+        return OperationResult(True, "该次导入没有新增词条，已清除记录", detail=rec.get("source", ""))
+    r = delete_entries(words)
+    if r.ok:
+        try:
+            os.remove(rec["_file"])
+        except OSError:
+            pass
+        sample = "、".join(words[:3])
+        more = f" 等 {len(words)} 条" if len(words) > 3 else ""
+        r.message = f"已撤销导入：删除「{sample}」{more}"
+    else:
+        r.message = f"撤销失败：{r.message}"
+    return r
+
 
 @dataclass
 class ImportPreview:
@@ -58,21 +178,29 @@ def udl_exists() -> bool:
 
 
 def count_entries() -> int:
-    path = get_udl_path()
-    if not os.path.exists(path):
-        return 0
     try:
-        return len(UdlFile().read(path))
+        return len(load_entries())
     except Exception:
         return 0
 
 
 def load_entries() -> List[UdlEntry]:
+    """读取全部词条；文件未变化时直接返回缓存（返回值为共享列表，调用方不得修改）"""
     path = get_udl_path()
     if not os.path.exists(path):
         return []
+    st = os.stat(path)
+    key = (st.st_mtime_ns, st.st_size)
+    if (
+        _ENTRIES_CACHE["key"] == key
+        and _ENTRIES_CACHE["path"] == path
+    ):
+        return _ENTRIES_CACHE["entries"]
     udl = UdlFile()
     udl.read(path)
+    _ENTRIES_CACHE["key"] = key
+    _ENTRIES_CACHE["path"] = path
+    _ENTRIES_CACHE["entries"] = udl.entries
     return udl.entries
 
 
@@ -85,7 +213,6 @@ def _normalize_list(tokens: Iterable[str]) -> tuple[List[str], List[str]]:
         w = normalize_term(str(t or ""))
         if not w:
             continue
-        compact = w  # 长度按可见字符
         if not looks_like_term(w):
             bad.append(w)
             continue
@@ -124,7 +251,26 @@ def backup_udl(label: str = "manual") -> Optional[str]:
         shutil.copy2(path, path + ".bak_openime")
     except Exception:
         pass
+    _prune_backups(backup_dir, keep=30)
     return dest
+
+
+def _prune_backups(backup_dir: str, keep: int = 30):
+    """备份只保留最近 keep 份，防止无限增长。"""
+    try:
+        files = [
+            os.path.join(backup_dir, f)
+            for f in os.listdir(backup_dir)
+            if f.lower().endswith(".dat")
+        ]
+        files.sort(key=os.path.getmtime, reverse=True)
+        for old in files[keep:]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def list_backups() -> List[str]:
@@ -143,6 +289,18 @@ def list_backups() -> List[str]:
 def restore_backup(backup_path: str) -> OperationResult:
     if not os.path.exists(backup_path):
         return OperationResult(False, "找不到备份文件")
+    # 先验货：备份必须能解析出词条，才允许覆盖当前词库
+    try:
+        check = UdlFile()
+        check_entries = check.read(backup_path)
+    except Exception as e:
+        return OperationResult(False, f"备份文件无效，已中止恢复：{e}")
+    if not check_entries:
+        return OperationResult(
+            False,
+            "备份文件里没有任何词条，已中止恢复",
+            detail="如确要恢复空词库，请手动复制文件覆盖 ChsPinyinUDL.dat",
+        )
     path = get_udl_path()
     if os.path.exists(path):
         backup_udl("before_restore")
@@ -151,8 +309,10 @@ def restore_backup(backup_path: str) -> OperationResult:
         shutil.copy2(backup_path, path)
     except Exception as e:
         return OperationResult(False, f"恢复失败：{e}")
+    _cache_invalidate()
+    _record_history("restore", os.path.basename(backup_path), total=len(check_entries), backup=backup_path)
     return OperationResult(
-        True, "已恢复备份", detail=backup_path, data={"count": count_entries()}
+        True, f"已恢复备份（{len(check_entries)} 条）", detail=backup_path, data={"count": count_entries()}
     )
 
 
@@ -181,7 +341,14 @@ def _apply_tokens_locked(tokens: Sequence[str], source_desc: str = "") -> Operat
             data={"added": 0, "already": len(preview.already)},
         )
 
-    backup_path = backup_udl("before_import")
+    try:
+        backup_path = backup_udl("before_import")
+    except Exception as e:
+        return OperationResult(
+            False,
+            f"备份失败，已中止写入：{e}",
+            detail="安全红线：写词库前必须完成备份。请检查 OpenIME_Backups 备份目录是否可写。",
+        )
     udl = UdlFile()
     if os.path.exists(path):
         try:
@@ -203,6 +370,12 @@ def _apply_tokens_locked(tokens: Sequence[str], source_desc: str = "") -> Operat
     except Exception as e:
         return OperationResult(False, f"写入失败：{e}", detail=f"备份：{backup_path}")
 
+    _cache_invalidate()
+    _record_history(
+        "import", source_desc, added=preview.to_add,
+        total=len(udl.entries), backup=backup_path or "",
+    )
+
     samples = preview.to_add[:3]
     tip = ""
     if samples:
@@ -217,6 +390,28 @@ def _apply_tokens_locked(tokens: Sequence[str], source_desc: str = "") -> Operat
             + tip
         ),
         data={"added": added, "total": len(udl.entries), "backup": backup_path, "samples": samples},
+    )
+
+
+def import_competition_library() -> OperationResult:
+    """把内置古诗文竞赛篇目（整句+节奏组）合并写入词库，幂等。"""
+    try:
+        import competition_data
+        from poetry_processor import entries_from_poem
+    except ImportError as e:
+        return OperationResult(False, f"缺少竞赛库模块：{e}")
+    ensure_ready()
+    terms: List[str] = []
+    seen = set()
+    for poem in competition_data.all_poems():
+        for w in entries_from_poem(poem["title"], poem["lines"]):
+            if w not in seen:
+                seen.add(w)
+                terms.append(w)
+    if not terms:
+        return OperationResult(False, "竞赛库为空")
+    return apply_tokens(
+        terms, source_desc=f"古诗文竞赛库（{competition_data.library_summary()}）"
     )
 
 
@@ -250,7 +445,11 @@ def import_files(
         return OperationResult(
             False,
             "文件都没读成",
-            detail="\n".join(errors) if errors else "请检查格式：支持 .txt .md .csv .pdf .docx",
+            detail=(
+                "\n".join(errors)
+                if errors
+                else "请检查格式：支持 .txt .md .csv .tsv .log .pdf .docx；.json 词库包请用「导入词库包」/ import-pack"
+            ),
         )
 
     all_terms: List[str] = []
@@ -315,8 +514,12 @@ def import_pack(path: str, merge: bool = True) -> OperationResult:
             if os.path.exists(path_udl):
                 try:
                     udl.read(path_udl)  # 取 raw_header
-                except Exception:
-                    pass
+                except Exception as e:
+                    return OperationResult(
+                        False,
+                        f"当前词库无法解析，已中止替换：{e}",
+                        detail="替换会覆盖旧词库；读不出旧词库头（0x470+ 索引区）时不能安全写入。请先恢复备份或手动处理。",
+                    )
             udl.entries = []
             for w in words:
                 udl.add_entry(w)
@@ -325,6 +528,11 @@ def import_pack(path: str, merge: bool = True) -> OperationResult:
                 udl.write(path_udl, preserve_header=True)
             except Exception as e:
                 return OperationResult(False, f"写入失败：{e}")
+            _cache_invalidate()
+            _record_history(
+                "replace", f"词库包「{name}」", added=words,
+                total=len(udl.entries), backup=backup_path or "",
+            )
             return OperationResult(True, f"已替换为 {len(udl.entries)} 条（{name}）", detail=f"备份：{backup_path}")
 
     return apply_tokens(words, source_desc=f"词库包「{name}」")
@@ -371,6 +579,9 @@ def _match_entry(entry: UdlEntry, kw: str) -> bool:
     if not kw:
         return True
     if kw in entry.word:
+        return True
+    # 英文词条大小写不敏感子串（如用 base / BASE 找 HBase）
+    if kw.lower() in entry.word.lower():
         return True
     # 纯中文/含中文已用子串；拼音仅对 ascii 查询有意义
     if not kw.isascii():
@@ -475,11 +686,18 @@ def delete_entries(words: Sequence[str]) -> OperationResult:
         path = get_udl_path()
         if not os.path.exists(path):
             return OperationResult(False, "词库文件不存在")
-        backup_path = backup_udl("before_delete")
+        try:
+            backup_path = backup_udl("before_delete")
+        except Exception as e:
+            return OperationResult(False, f"备份失败，已中止删除：{e}")
         udl = UdlFile()
-        udl.read(path)
+        try:
+            udl.read(path)
+        except Exception as e:
+            return OperationResult(False, f"读取现有词库失败，已中止删除：{e}")
         before = len(udl.entries)
         word_set = set(words)
+        removed_words = [e.word for e in udl.entries if e.word in word_set]
         udl.entries = [e for e in udl.entries if e.word not in word_set]
         removed = before - len(udl.entries)
         try:
@@ -487,7 +705,58 @@ def delete_entries(words: Sequence[str]) -> OperationResult:
             udl.write(path, preserve_header=True)
         except Exception as e:
             return OperationResult(False, f"写入失败：{e}")
+        _cache_invalidate()
+        _record_history(
+            "delete", "手动删除", removed=removed_words,
+            total=len(udl.entries), backup=backup_path or "",
+        )
         return OperationResult(True, f"已删除 {removed} 条", detail=f"备份：{backup_path}")
+
+
+def update_entry_pinyin(word: str, pinyin_input) -> OperationResult:
+    """人工修正某条词条的拼音（多音字）；简拼会按新拼音自动重算。"""
+    word = (word or "").strip()
+    if not word:
+        return OperationResult(False, "缺少词条")
+    if isinstance(pinyin_input, str):
+        pys = [p for p in re.split(r"[\s,，、]+", pinyin_input.strip()) if p]
+    else:
+        pys = [str(p).strip() for p in (pinyin_input or []) if str(p).strip()]
+
+    with _WRITE_LOCK:
+        ensure_ready()
+        path = get_udl_path()
+        if not os.path.exists(path):
+            return OperationResult(False, "词库文件不存在")
+        udl = UdlFile()
+        try:
+            udl.read(path)
+        except Exception as e:
+            return OperationResult(False, f"读取现有词库失败，已中止：{e}")
+        target = udl.find_entry(word)
+        if not target:
+            return OperationResult(False, f"词库里没有「{word}」")
+        n = len(target.word)
+        if len(pys) < n:
+            pys = pys + [""] * (n - len(pys))
+        pys = pys[:n]
+        try:
+            backup_path = backup_udl("before_edit")
+        except Exception as e:
+            return OperationResult(False, f"备份失败，已中止修改：{e}")
+        target.pinyin = pys
+        target.jianpin = b"\x00\x00\x00"  # 写入时按新拼音重算简拼
+        try:
+            udl.write(path, preserve_header=True)
+        except Exception as e:
+            return OperationResult(False, f"写入失败：{e}", detail=f"备份：{backup_path}")
+        _cache_invalidate()
+        _record_history(
+            "edit", f"修改拼音：{word}", added=[word],
+            total=len(udl.entries), backup=backup_path or "",
+        )
+        shown = " ".join(p for p in pys if p) or "（未提供音节，缺省位将用哨兵索引）"
+        return OperationResult(True, f"已更新「{word}」的拼音", detail=shown)
 
 
 def status_summary() -> dict:
