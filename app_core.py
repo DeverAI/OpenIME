@@ -15,7 +15,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable, List, Optional, Sequence
 
-from udl_core import UdlFile, UdlEntry, get_default_udl_path, load_pinyin_table, MAX_WORD_LEN
+from udl_core import (
+    UdlFile, UdlEntry, get_default_udl_path, load_pinyin_table,
+    MAX_WORD_LEN, is_known_syllable,
+)
 from term_extractor import extract, normalize_term, looks_like_term, MIN_WORD_LEN
 from document_loader import load_document, load_many, SUPPORTED_EXT
 from paths import user_data_dir
@@ -246,6 +249,11 @@ def backup_udl(label: str = "manual") -> Optional[str]:
     os.makedirs(backup_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dest = os.path.join(backup_dir, f"ChsPinyinUDL_{label}_{ts}.dat")
+    # 同秒同标签第二次备份不能覆盖第一次（脚本批量写入真实场景）
+    n = 2
+    while os.path.exists(dest):
+        dest = os.path.join(backup_dir, f"ChsPinyinUDL_{label}_{ts}_{n}.dat")
+        n += 1
     shutil.copy2(path, dest)
     try:
         shutil.copy2(path, path + ".bak_openime")
@@ -302,15 +310,34 @@ def restore_backup(backup_path: str) -> OperationResult:
             detail="如确要恢复空词库，请手动复制文件覆盖 ChsPinyinUDL.dat",
         )
     path = get_udl_path()
-    if os.path.exists(path):
-        backup_udl("before_restore")
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        shutil.copy2(backup_path, path)
-    except Exception as e:
-        return OperationResult(False, f"恢复失败：{e}")
-    _cache_invalidate()
-    _record_history("restore", os.path.basename(backup_path), total=len(check_entries), backup=backup_path)
+    # 恢复是写路径：与其他写操作互斥；先备份当前库，经临时文件原子替换
+    with _WRITE_LOCK:
+        if os.path.exists(path):
+            try:
+                backup_udl("before_restore")
+            except Exception as e:
+                return OperationResult(
+                    False,
+                    f"备份失败，已中止恢复：{e}",
+                    detail="安全红线：恢复会覆盖当前词库，覆盖前必须先备份成功。请检查 OpenIME_Backups 备份目录是否可写。",
+                )
+        tmp_path = f"{path}.{os.getpid()}.restore_tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            shutil.copy2(backup_path, tmp_path)
+            os.replace(tmp_path, path)
+        except Exception as e:
+            return OperationResult(False, f"恢复失败：{e}")
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        _cache_invalidate()
+        _record_history(
+            "restore", os.path.basename(backup_path), total=len(check_entries), backup=backup_path
+        )
     return OperationResult(
         True, f"已恢复备份（{len(check_entries)} 条）", detail=backup_path, data={"count": count_entries()}
     )
@@ -479,8 +506,49 @@ def add_words(words: Sequence[str]) -> OperationResult:
     return apply_tokens(words, source_desc="手动添加")
 
 
+def _pack_terms(data: dict) -> tuple:
+    """词库包 JSON → ([(word, pinyin或None), …], 规则拒绝列表)。
+
+    带拼音的词条只在拼音全部合法（表内音节）时保留，否则宁可重新猜音，
+    也不把非法音节写成哨兵。
+    """
+    items = data.get("entries") or data.get("words") or []
+    out: List[tuple] = []
+    rejected: List[str] = []
+    seen = set()
+    for it in items:
+        if isinstance(it, str):
+            raw, py = it, None
+        elif isinstance(it, dict):
+            raw = it.get("word") or it.get("text") or ""
+            py = it.get("pinyin")
+        else:
+            continue
+        w = normalize_term(str(raw or ""))
+        if not w:
+            continue
+        if not looks_like_term(w):
+            rejected.append(w)
+            continue
+        if py is not None:
+            if isinstance(py, str):
+                py = py.split()
+            py = [str(p).strip().lower() for p in py if str(p).strip()]
+            if not py or not all(is_known_syllable(p) for p in py):
+                py = None
+        if w in seen:
+            continue
+        seen.add(w)
+        out.append((w, py))
+    return out, rejected
+
+
 def import_pack(path: str, merge: bool = True) -> OperationResult:
-    """导入 OpenIME 词库包 JSON"""
+    """导入 OpenIME 词库包 JSON。
+
+    词条带合法拼音时保留原拼音（导出→分发→导入的往返不再丢改音成果）；
+    全部不带拼音时走与普通导入相同的猜音链路。
+    """
     if not os.path.exists(path):
         return OperationResult(False, f"找不到文件：{path}")
     try:
@@ -489,18 +557,12 @@ def import_pack(path: str, merge: bool = True) -> OperationResult:
     except Exception as e:
         return OperationResult(False, f"JSON 解析失败：{e}")
 
-    items = data.get("entries") or data.get("words") or []
-    words = []
-    for it in items:
-        if isinstance(it, str):
-            words.append(it)
-        elif isinstance(it, dict):
-            words.append(it.get("word") or it.get("text") or "")
-
+    ensure_ready()  # 先加载拼音表，_pack_terms 校验音节才有效
     name = data.get("name") or os.path.basename(path)
-    words, _ = _normalize_list(words)
+    terms, _rejected = _pack_terms(data)
+
     if not merge:
-        if not words:
+        if not terms:
             return OperationResult(
                 False,
                 "词库包里没有有效词条，已中止",
@@ -509,7 +571,14 @@ def import_pack(path: str, merge: bool = True) -> OperationResult:
         with _WRITE_LOCK:
             ensure_ready()
             path_udl = get_udl_path()
-            backup_path = backup_udl("before_replace")
+            try:
+                backup_path = backup_udl("before_replace")
+            except Exception as e:
+                return OperationResult(
+                    False,
+                    f"备份失败，已中止替换：{e}",
+                    detail="安全红线：替换会覆盖整个词库，覆盖前必须先备份成功。请检查 OpenIME_Backups 备份目录是否可写。",
+                )
             udl = UdlFile()
             if os.path.exists(path_udl):
                 try:
@@ -521,8 +590,8 @@ def import_pack(path: str, merge: bool = True) -> OperationResult:
                         detail="替换会覆盖旧词库；读不出旧词库头（0x470+ 索引区）时不能安全写入。请先恢复备份或手动处理。",
                     )
             udl.entries = []
-            for w in words:
-                udl.add_entry(w)
+            for w, py in terms:
+                udl.add_entry(w, pinyin=list(py) if py else None)
             try:
                 os.makedirs(os.path.dirname(path_udl), exist_ok=True)
                 udl.write(path_udl, preserve_header=True)
@@ -530,12 +599,72 @@ def import_pack(path: str, merge: bool = True) -> OperationResult:
                 return OperationResult(False, f"写入失败：{e}")
             _cache_invalidate()
             _record_history(
-                "replace", f"词库包「{name}」", added=words,
+                "replace", f"词库包「{name}」", added=[w for w, _ in terms],
                 total=len(udl.entries), backup=backup_path or "",
             )
             return OperationResult(True, f"已替换为 {len(udl.entries)} 条（{name}）", detail=f"备份：{backup_path}")
 
-    return apply_tokens(words, source_desc=f"词库包「{name}」")
+    # 合并：全部无拼音 → 与普通导入同一链路（预览语义一致）
+    if all(py is None for _, py in terms):
+        return apply_tokens([w for w, _ in terms], source_desc=f"词库包「{name}」")
+
+    # 合并：包里带拼音 → 保拼音写入（已有词只更新拼音，不重复新增）
+    with _WRITE_LOCK:
+        ensure_ready()
+        path_udl = get_udl_path()
+        try:
+            backup_path = backup_udl("before_import")
+        except Exception as e:
+            return OperationResult(
+                False,
+                f"备份失败，已中止写入：{e}",
+                detail="安全红线：写词库前必须完成备份。请检查 OpenIME_Backups 备份目录是否可写。",
+            )
+        udl = UdlFile()
+        if os.path.exists(path_udl):
+            try:
+                udl.read(path_udl)
+            except Exception as e:
+                return OperationResult(False, f"读取现有词库失败：{e}", detail="已中止，未写入")
+        existing = {e.word: e for e in udl.entries}
+        added: List[str] = []
+        updated: List[str] = []
+        for w, py in terms:
+            if w in existing:
+                e = existing[w]
+                if py and e.pinyin != list(py):
+                    e.pinyin = list(py)
+                    e.jianpin = b"\x00\x00\x00"  # 写入时按新拼音重算简拼
+                    updated.append(w)
+                continue
+            udl.add_entry(w, pinyin=list(py) if py else None)
+            if udl.entries and udl.entries[-1].word == w:
+                existing[w] = udl.entries[-1]
+                added.append(w)
+        if not added and not updated:
+            return OperationResult(
+                True,
+                f"没有新增：{len(terms)} 条都已在词库中",
+                detail=f"词库包「{name}」",
+                data={"added": 0, "updated": 0},
+            )
+        try:
+            os.makedirs(os.path.dirname(path_udl), exist_ok=True)
+            udl.write(path_udl, preserve_header=True)
+        except Exception as e:
+            return OperationResult(False, f"写入失败：{e}", detail=f"备份：{backup_path}")
+        _cache_invalidate()
+        _record_history(
+            "import", f"词库包「{name}」", added=added,
+            total=len(udl.entries), backup=backup_path or "",
+        )
+        msg = f"导入 {len(added)} 条新词条"
+        if updated:
+            msg += f"，并更新 {len(updated)} 条已有词的拼音"
+        detail = f"词库现共 {len(udl.entries)} 条。" + (f"备份：{backup_path}" if backup_path else "（原词库为空，已新建）")
+        if updated:
+            detail += "\n更新拼音：" + "、".join(updated[:5]) + ("…" if len(updated) > 5 else "")
+        return OperationResult(True, msg, detail=detail, data={"added": len(added), "updated": len(updated)})
 
 
 def export_pack(output_path: Optional[str] = None, name: str = "OpenIME 词库包") -> OperationResult:
@@ -719,9 +848,9 @@ def update_entry_pinyin(word: str, pinyin_input) -> OperationResult:
     if not word:
         return OperationResult(False, "缺少词条")
     if isinstance(pinyin_input, str):
-        pys = [p for p in re.split(r"[\s,，、]+", pinyin_input.strip()) if p]
+        pys = [p.strip().lower() for p in re.split(r"[\s,，、]+", pinyin_input.strip()) if p]
     else:
-        pys = [str(p).strip() for p in (pinyin_input or []) if str(p).strip()]
+        pys = [str(p).strip().lower() for p in (pinyin_input or []) if str(p).strip()]
 
     with _WRITE_LOCK:
         ensure_ready()
@@ -736,6 +865,15 @@ def update_entry_pinyin(word: str, pinyin_input) -> OperationResult:
         target = udl.find_entry(word)
         if not target:
             return OperationResult(False, f"词库里没有「{word}」")
+        # 音节校验：带声调/带数字（zhòng、qing4）写进索引区会整体变哨兵，
+        # 用户以为改好了、实际整词失音，必须在写前明确拒绝。
+        unknown = [p for p in pys if not is_known_syllable(p)]
+        if unknown:
+            return OperationResult(
+                False,
+                f"这些音节不在拼音表里：{' '.join(unknown)}",
+                detail="请用不带声调的小写拼音（如 zhong qing），空格分隔；不确定的字留空即可。",
+            )
         n = len(target.word)
         if len(pys) < n:
             pys = pys + [""] * (n - len(pys))

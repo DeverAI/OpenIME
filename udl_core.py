@@ -27,6 +27,16 @@ MAX_WORD_LEN = 12
 # 无有效拼音时写入的哨兵（避免误写成 0 = 音节 a）
 UNKNOWN_PY_INDEX = 0xFFFF
 
+# 表里同音节可能有多个槽位（真机如此）。写入时选哪个槽位，按 2026-09-15
+# 真机 8697 条词条逐字位统计的主用槽位确定：
+#   ai → 1（碍挨唉 7 次）对 80（欸 11 次）→ 取首现 1
+#   de → 61（的得地德 1503 次）对 62（得 72 次）→ 取首现 61
+#   fu → 91（佛 1 次）对 93（服复付覆附 245 次）→ 93 是主用，须显式覆盖
+#   ge → 99（个格各歌隔 647 次）对 182（咯 4 次）→ 取首现 99
+# 规则：默认取首次出现；主用槽位不是首现的音节在 PREFERRED_DUP_INDEX 覆盖。
+# 此前实现取"最后一次出现"，会把 de 写到 62、ge 写到 182、ai 写到 80（真机罕见槽位）。
+PREFERRED_DUP_INDEX = {"fu": 93}
+
 
 @dataclass
 class UdlEntry:
@@ -71,7 +81,13 @@ def load_pinyin_table(path: str = None):
             path = os.path.join(os.path.dirname(__file__), 'pinyin_table.json')
     with open(path, 'r', encoding='utf-8') as f:
         PINYIN_TABLE = json.load(f)
-    PINYIN_TABLE_INDEX = {py: idx for idx, py in enumerate(PINYIN_TABLE)}
+    # 同音节多槽位时取首次出现（真机主用槽位绝大多数是首现；fu 由上面覆盖表修正）
+    PINYIN_TABLE_INDEX = {}
+    for idx, py in enumerate(PINYIN_TABLE):
+        PINYIN_TABLE_INDEX.setdefault(py, idx)
+    for py, idx in PREFERRED_DUP_INDEX.items():
+        if py in PINYIN_TABLE_INDEX:
+            PINYIN_TABLE_INDEX[py] = idx
     return PINYIN_TABLE
 
 
@@ -90,6 +106,11 @@ def get_index_by_pinyin(pinyin: str) -> int:
     if idx is None:
         return UNKNOWN_PY_INDEX
     return idx
+
+
+def is_known_syllable(pinyin: str) -> bool:
+    """是否是拼音表内的合法音节（写入前校验用；空串不算）"""
+    return bool(pinyin) and pinyin.lower() in PINYIN_TABLE_INDEX
 
 
 class UdlFile:
@@ -387,9 +408,11 @@ class UdlFile:
         ]
 
     def from_dict_list(self, items: List[dict]):
-        """从字典列表导入（跳过非法长度，避免写坏文件）"""
+        """从字典列表导入（跳过非 dict 元素与非法长度，避免写坏文件）"""
         self.entries = []
         for item in items:
+            if not isinstance(item, dict):
+                continue
             word = str(item.get('word') or item.get('text') or '').strip()
             if not word or len(word) < 2 or len(word) > MAX_WORD_LEN:
                 continue

@@ -39,6 +39,7 @@ def run_cli(argv) -> int:
   OpenIME.exe import-pack -c pack.json
   OpenIME.exe undo                        # 撤销最近一次导入
   OpenIME.exe history                     # 查看操作历史
+  OpenIME.exe import-comp                 # 导入内置古诗文竞赛库（116 首）
         """,
     )
     sub = parser.add_subparsers(dest="command")
@@ -66,6 +67,10 @@ def run_cli(argv) -> int:
     sub.add_parser("backup", help="备份")
     sub.add_parser("undo", help="撤销最近一次导入（删除那批词条）")
     sub.add_parser("history", help="查看导入/删除/替换历史")
+    sub.add_parser(
+        "import-comp",
+        help="导入内置古诗文竞赛篇目库（116 首，整句+节奏组，幂等）",
+    )
 
     p = sub.add_parser("restore", help="恢复备份")
     p.add_argument("path")
@@ -101,6 +106,10 @@ def run_cli(argv) -> int:
         if args.text:
             texts.append(args.text)
         if not texts:
+            if sys.stdin is None:
+                # windowed exe 没有标准输入，直接读会崩
+                print("图形打包版没有命令行输入，请用 -f 文件 或 -t 文本 提供内容")
+                return 1
             print("请粘贴内容，Windows 结束: Ctrl+Z 回车")
             texts.append(sys.stdin.read())
         from term_extractor import extract
@@ -151,6 +160,8 @@ def run_cli(argv) -> int:
         return 0
     elif args.command == "undo":
         r = app_core.undo_last_import()
+    elif args.command == "import-comp":
+        r = app_core.import_competition_library()
     elif args.command == "history":
         recs = app_core.list_history()
         if not recs:

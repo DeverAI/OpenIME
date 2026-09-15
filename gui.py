@@ -127,6 +127,7 @@ class App(tk.Tk):
                 rowp, label,
                 lambda f=fname, lb=label: self.on_quick_pack(f, lb),
             ).pack(side="left", padx=(0, 6))
+        self._btn(rowp, "古诗文竞赛库", self.on_import_comp, False).pack(side="left", padx=(6, 0))
 
         # 管理区
         box2 = ttk.LabelFrame(self, text=" 管理 ", style="Box.TLabelframe")
@@ -361,6 +362,12 @@ class App(tk.Tk):
             )
             return
         self._import_flow([path], mode="lines", latin=False, title=f"词库包·{label}")
+
+    def on_import_comp(self):
+        """内置古诗文竞赛篇目库（116 首，整句+节奏组），幂等合并。"""
+        if self._busy:
+            return
+        self._run_async(app_core.import_competition_library, "古诗文竞赛库")
 
     def on_undo(self):
         def work():

@@ -19,6 +19,8 @@ _LATIN_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_+\-./]{1,31}")
 _LINE_SPLIT = re.compile(r"[\r\n]+")
 # 句读切分：中英标点
 _SENT_SPLIT = re.compile(r"[，。！？；：、,!?;:\s—…·「」『』【】（）()\[\]{}<>《》\"'\"]+")
+# 行首列表记号（与 extract_from_lines 的剥除规则保持一致）
+_LIST_MARK = re.compile(r"^\s*(?:[-–—*•·]|\d+[\.、)])\s*")
 
 _STOP_WORDS = {
     "一个", "我们", "你们", "他们", "这个", "那个", "可以", "什么", "怎么",
@@ -67,6 +69,10 @@ def looks_like_term(s: str) -> bool:
     if len(compact) < MIN_WORD_LEN:
         return False
 
+    # 纯数字/纯标点不放行（规范：过滤纯标点数字；至少要有一个字母或汉字）
+    if not any(is_cjk_ch(ch) or (ch.isascii() and ch.isalpha()) for ch in compact):
+        return False
+
     # 基本平面外的字符（UTF-16 代理对）写不进 UDL 的 60 字节结构，直接拒
     if any(ord(ch) > 0xFFFF for ch in compact):
         return False
@@ -92,9 +98,12 @@ def looks_like_term(s: str) -> bool:
 
 def _push(bucket: List[str], seen: set, term: str):
     t = normalize_term(term)
+    # 剥离行首列表记号（"1."、"-"、"•" 等）：lines 模式在行级已剥，
+    # 这里兜底让 auto / sentences 模式同样不吃进 "1.化学变化" 这类脏词条。
+    # 已知代价：形如 "5.2版本" 的词首段会被剥掉（lines 模式此前同样如此）。
+    t = _LIST_MARK.sub("", t)
     if not looks_like_term(t):
         return
-    t = normalize_term(t)
     if t in seen:
         return
     seen.add(t)
