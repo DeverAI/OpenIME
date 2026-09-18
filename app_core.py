@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import threading
@@ -60,6 +61,7 @@ def _record_history(
         rec = {
             "time": datetime.now().isoformat(timespec="seconds"),
             "action": action,
+            "machine": platform.node(),
             "source": source_desc or "",
             "added": list(added or []),
             "removed": list(removed or []),
@@ -147,6 +149,250 @@ def undo_last_import() -> OperationResult:
     return r
 
 
+# ---------- 词条分区（依托 OpenIME 自带 config，整个 %APPDATA%\OpenIME 可暴力移植） ----------
+# 手动分区存 partitions.json；自动批次分区由导入历史 manifest 派生。
+# manifest/分区记录都带 machine：配置目录拷到别的机器后，原机器自动记录的部分
+# 会以「[自动] 原机器名 …」独立成区，仍可单独清除。
+
+PARTITION_AUTO_PREFIX = "[自动] "
+# GUI「全部词条」视图名，同样是保留分区名（撞名会让"全部"视图变成分区过滤）
+PARTITION_ALL_NAME = "全部词条"
+# partitions.json 的读-改-写互斥（GUI worker 线程与主线程可能同时进）
+_PARTITIONS_LOCK = threading.RLock()
+
+
+def _partitions_path() -> str:
+    return os.path.join(user_data_dir(), "partitions.json")
+
+
+def _load_partitions_file() -> dict:
+    """缺文件 → 空；文件存在但读/解析失败 → 抛错。
+    坏文件不得静默当空，否则下一次保存会把既有分区全覆掉。"""
+    path = _partitions_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        raise RuntimeError(f"partitions.json 读取失败（可能损坏或被占用），已拒绝继续写分区：{e}") from e
+    parts = data.get("partitions") if isinstance(data, dict) else None
+    if not isinstance(parts, dict):
+        raise RuntimeError("partitions.json 结构不是 OpenIME 分区文件，已拒绝继续写分区")
+    return parts
+
+
+def _save_partitions_file(mapping: dict):
+    path = _partitions_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {"format": "openime-partitions", "version": 1, "partitions": mapping}
+    # tmp 名带线程 id：同进程两线程先后保存不会撞同一个 tmp
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def list_partitions() -> List[dict]:
+    """全部分区：手动（partitions.json）+ 自动批次（导入历史，名字含机器名）。
+
+    返回 [{name, kind, machine, created, words, _file?}]，name 全局唯一。
+    """
+    out: List[dict] = []
+    used = set()
+
+    def _unique(n: str) -> str:
+        base, k = n, 2
+        while base in used:
+            base = f"{n}_{k}"
+            k += 1
+        used.add(base)
+        return base
+
+    for name, ent in _load_partitions_file().items():
+        ent = ent if isinstance(ent, dict) else {}
+        words = [w for w in (ent.get("words") or []) if w]
+        out.append({
+            "name": _unique(name), "kind": "manual",
+            "machine": ent.get("machine") or "",
+            "created": ent.get("created") or "",
+            "words": words,
+        })
+    for rec in list_history():
+        if rec.get("action") != "import":
+            continue
+        words = [w for w in (rec.get("added") or []) if w]
+        if not words:
+            continue
+        src = (rec.get("source") or "").splitlines()
+        label = (src[0] if src else "导入")[:24]
+        machine = rec.get("machine") or "旧记录"
+        out.append({
+            "name": _unique(f"{PARTITION_AUTO_PREFIX}{machine} {rec.get('time', '?')} {label}"),
+            "kind": "auto", "machine": machine,
+            "created": rec.get("time", ""), "words": words,
+            "_file": rec.get("_file"),
+        })
+    return out
+
+
+def _clean_word_list(words: Iterable[str]) -> List[str]:
+    uniq: List[str] = []
+    seen = set()
+    for w in words:
+        w = str(w or "").strip()
+        if w and w not in seen:
+            seen.add(w)
+            uniq.append(w)
+    return uniq
+
+
+def create_partition(name: str, words: Sequence[str]) -> OperationResult:
+    """把一批词条存入命名分区；分区已存在则合并去重（不碰词库本体）。"""
+    name = ((name or "").splitlines() or [""])[0].strip()[:40]
+    if not name:
+        return OperationResult(False, "分区名为空")
+    if name.startswith(PARTITION_AUTO_PREFIX.strip()):
+        return OperationResult(False, f"「{PARTITION_AUTO_PREFIX.strip()}」前缀保留给自动批次分区")
+    if name == PARTITION_ALL_NAME:
+        return OperationResult(False, f"「{PARTITION_ALL_NAME}」是保留名（全部词条视图）")
+    uniq = _clean_word_list(words)
+    if not uniq:
+        return OperationResult(False, "没有可存入的词条")
+    with _PARTITIONS_LOCK:
+        try:
+            mapping = _load_partitions_file()
+        except RuntimeError as e:
+            return OperationResult(False, str(e))
+        if name in mapping:
+            old = [w for w in (mapping[name] or {}).get("words") or [] if w]
+            merged = old + [w for w in uniq if w not in set(old)]
+            mapping[name] = dict(mapping[name] or {})
+            mapping[name]["words"] = merged
+            try:
+                _save_partitions_file(mapping)
+            except Exception as e:
+                return OperationResult(False, f"分区保存失败：{e}")
+            added_n = len(merged) - len(old)
+            return OperationResult(
+                True, f"已合并进分区「{name}」：共 {len(merged)} 条（本次并入 {added_n}）",
+                data={"total": len(merged), "added": added_n, "name": name},
+            )
+        mapping[name] = {
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "machine": platform.node(),
+            "words": uniq,
+        }
+        try:
+            _save_partitions_file(mapping)
+        except Exception as e:
+            return OperationResult(False, f"分区保存失败：{e}")
+    return OperationResult(
+        True, f"已建分区「{name}」，{len(uniq)} 条",
+        detail="分区记录在 %APPDATA%\\OpenIME\\partitions.json，随配置目录整体迁移",
+        data={"total": len(uniq), "added": len(uniq), "name": name},
+    )
+
+
+def remove_partition(name: str, delete_words: bool = True) -> OperationResult:
+    """清除分区：delete_words=True 时先删词库里的这批词（自动备份），再删分区记录；
+    False 时只忘记分区、不碰词库。"""
+    name = (name or "").strip()
+    if not name:
+        return OperationResult(False, "缺少分区名")
+    part = next((p for p in list_partitions() if p["name"] == name), None)
+    if not part:
+        return OperationResult(False, f"找不到分区「{name}」")
+    words = part["words"]
+    deleted = 0
+    missing = 0
+    backup = ""
+    if delete_words and words:
+        existing = {e.word for e in load_entries()}
+        present = [w for w in words if w in existing]
+        missing = len(words) - len(present)
+        if present:
+            r = delete_entries(present)
+            if not r.ok:
+                return r
+            deleted = len(present)
+            backup = r.detail or ""
+    if part["kind"] == "manual":
+        record_error = ""
+        with _PARTITIONS_LOCK:
+            try:
+                mapping = _load_partitions_file()
+                mapping.pop(name, None)
+                _save_partitions_file(mapping)
+            except Exception as e:
+                record_error = f"分区记录删除失败：{e}"
+    else:
+        record_error = ""
+        try:
+            if part.get("_file"):
+                os.remove(part["_file"])
+        except OSError as e:
+            # 记录删不掉（文件被占用等）必须如实报：静默成功会留下幽灵分区，
+            # 再次清除会把期间重新导入的同名词条再删一遍
+            record_error = f"该批次的导入历史文件未能移除（可能被占用）：{e}"
+    if delete_words:
+        msg = f"分区「{name}」已清除：删掉 {deleted} 条"
+        if missing:
+            msg += f"（另 {missing} 条已不在词库）"
+    elif part["kind"] == "auto":
+        msg = "该批次的导入记录已移除（词条保留；此批的自动分区与撤销入口不再显示）"
+    else:
+        msg = f"分区「{name}」记录已移除（词条保留）"
+    if record_error:
+        msg += f"；但{record_error}，该分区可能仍会出现在列表里"
+    return OperationResult(
+        True, msg, detail=backup,
+        data={"deleted": deleted, "missing": missing, "record_error": record_error},
+    )
+
+
+# ---------- 让词库改动立即生效 ----------
+
+IME_HOST_IMAGE = "TextInputHost.exe"
+
+
+def reload_ime() -> OperationResult:
+    """结束微软拼音宿主进程，系统会立刻自动拉起它，它会重新读取用户词库。
+    实测（2026-09-19）：词库文件写盘后运行中的输入法仍用内存里的旧词库，
+    中英文切换不重载；杀 TextInputHost 是唯一无需注销/重启电脑的重载手段。"""
+    if os.name != "nt":
+        return OperationResult(False, "非 Windows 系统，没有微软拼音宿主进程")
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["taskkill", "/F", "/IM", IME_HOST_IMAGE],
+            capture_output=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:
+        return OperationResult(False, f"重载输入法失败：{e}")
+    if r.returncode == 0:
+        return OperationResult(True, "输入法已重载，新词立即生效（输入法条会闪一下，属正常）")
+    out = ""
+    for pipe in (r.stdout, r.stderr):
+        try:
+            out += bytes(pipe or b"").decode("mbcs", "replace")
+        except Exception:
+            pass
+    if "not found" in out.lower() or "找不到" in out:
+        return OperationResult(True, "输入法宿主当前没在运行，下次调用输入法时会自动读取新词库")
+    return OperationResult(False, f"输入法宿主未能结束：{out.strip()[:200]}")
+
+
 @dataclass
 class ImportPreview:
     to_add: List[str]
@@ -158,6 +404,23 @@ class ImportPreview:
     @property
     def add_count(self) -> int:
         return len(self.to_add)
+
+    def describe(self) -> List[str]:
+        """预览文案（GUI/CLI 共用）。0 新增时必须说清"没有可写的"，
+        不能让"写入 0 条"和真实新增同形（第四轮 F12 记而未改项）。"""
+        lines = (self.source_desc or "").splitlines()
+        total = self.add_count + len(self.already)
+        if self.add_count:
+            lines.append(
+                f"有效候选 {total} 条 → 新增 {self.add_count} 条，"
+                f"已存在 {len(self.already)} 条，规则过滤 {len(self.rejected)} 条。"
+            )
+            lines.append(f"导入后词库约 {self.total_after} 条。")
+        else:
+            lines.append(f"有效候选 {total} 条已全部在词库中，本次没有可新增的词条。")
+            if self.rejected:
+                lines.append(f"另有 {len(self.rejected)} 条被规则过滤。")
+        return lines
 
 
 @dataclass
@@ -413,7 +676,8 @@ def _apply_tokens_locked(tokens: Sequence[str], source_desc: str = "") -> Operat
         detail=(
             f"词库现共 {len(udl.entries)} 条。"
             + (f"备份：{backup_path}" if backup_path else "（原词库为空，已新建）")
-            + "\n请注销重新登录，或中/英文切换一次使输入法加载。"
+            + "\n新词需输入法重新加载才生效：点「重载输入法」（或 CLI reload-ime），"
+            "无需注销/重启电脑；重载后输入法条会闪一下属正常。"
             + tip
         ),
         data={"added": added, "total": len(udl.entries), "backup": backup_path, "samples": samples},
@@ -759,16 +1023,22 @@ def query_entries(
     keyword: str = "",
     page: int = 0,
     page_size: int = 100,
+    only_words: Optional[Sequence[str]] = None,
 ) -> dict:
     """
     分页查询词库。
 
     返回 items / total（过滤后）/ total_all / page / pages / stats
+    only_words：分区过滤，只保留词在这些词条里的项。
     """
     ensure_ready()
     entries = load_entries()
     total_all = len(entries)
     kw = (keyword or "").strip()
+
+    if only_words is not None:
+        ws = set(only_words)
+        entries = [e for e in entries if e.word in ws]
 
     if kw:
         filtered = [e for e in entries if _match_entry(e, kw)]

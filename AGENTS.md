@@ -22,7 +22,9 @@
 - **基本平面外字符（UTF-16 代理对，如 𠮷）写不进 60 字节词条结构**：`looks_like_term` / `add_entry` / `write` payload 三处都必须拒收
 - `load_entries()` 按 (mtime,size) 缓存并返回共享列表，调用方**不得修改**；写路径成功后必须 `_cache_invalidate()`
 - 导入历史 manifest 在 `%APPDATA%\OpenIME\history\`；`undo_last_import()` 删最近一批新增词；**历史排序必须按文件 mtime（`_history_files()`）**——文件名同秒 `_N` 后缀有字典序陷阱（`import_9 > import_10`），按名排会取错"最近"
+- **词条分区（第五轮追加）**：手动分区存 `%APPDATA%\OpenIME\partitions.json`（读改写全程 `_PARTITIONS_LOCK`；原子写 tmp 带 pid+线程id+fsync；**坏文件必须抛错拒写、绝不静默当空覆掉既有分区**）；自动分区不落数据、由 history manifest 派生，命名 `[自动] {machine} {time} {source}`，`_record_history` 带 `machine: platform.node()`、无 machine 的旧记录归"旧记录"；`[自动]` 与 `PARTITION_ALL_NAME`（全部词条）都是保留名不许手动创建；拷 `%APPDATA%\OpenIME` 整目录即暴力移植，源机器批次在新机单独成区；`query_entries(only_words=)` 过滤先于关键词/分页；`remove_partition` 词删走 `delete_entries`（备份+写锁+历史），**manifest/记录删除失败必须如实并入结果消息（`data.record_error`），不得静默成功留幽灵分区**
 - APPDATA 为空必须报错
+- **生效机制（F19，真机实证）**：`TextInputHost.exe`（微软拼音宿主）启动时把 UDL 读进内存，之后磁盘改动不可见；**中英文切换不会重载**（旧提示文案是错的）。运行中的输入法学习新词时会**自行回写** UDL 文件——写完不重载继续打字有被旧内存副本覆盖的风险。正规刷新手段 = `app_core.reload_ime()`（`taskkill /F /IM TextInputHost.exe`，系统秒级自动拉起，无需注销/重启电脑）；GUI「重载输入法」按钮 / CLI `reload-ime` 均调它；测试中 `subprocess.run` 必须 mock，绝不真杀进程
 - 备份目录: 同级 `OpenIME_Backups/`，只保留最近 30 份
 - 检修记录: `docs/检修记录.md`
 
@@ -55,6 +57,8 @@ OpenIME/
 ├── test_fixes.py           # 原子写/缓存/历史/撤销/改拼音回归
 ├── test_round3.py          # 第三轮检修回归（拼音对齐/代理对/引导/安全中止）
 ├── test_round4.py          # 第四轮检修回归（主用槽位/保拼音往返/音节校验/竞赛库入口）
+├── test_round5.py          # 第五轮检修回归（预览文案分叉/CLI stdin 防护/reload_ime mock 探针/GUI Tk 冒烟）
+├── test_partitions.py      # 分区功能回归（存储/锁并发/派生/过滤/清除/坏文件/暴力移植探针）
 ├── test_udl.py             # 真机只读体检工具（产物写 %TEMP%，不属于回归套件）
 ├── docs/检修记录.md         # 历轮检修记录
 ├── docs/链路检查状态.md     # 链式检查状态表（每轮更新）
@@ -78,6 +82,8 @@ python test_competition_flow.py
 python test_fixes.py
 python test_round3.py
 python test_round4.py
+python test_round5.py
+python test_partitions.py
 ```
 使用临时 APPDATA，不碰真实词库。改 UDL/拼音表/抽词后必须全过。
 真机文件头对照与风险见 `docs/检修记录.md`。

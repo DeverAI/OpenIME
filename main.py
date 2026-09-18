@@ -37,6 +37,7 @@ def run_cli(argv) -> int:
   OpenIME.exe query -k 产品
   OpenIME.exe export -o pack.json
   OpenIME.exe import-pack -c pack.json
+  OpenIME.exe reload-ime                  # 词库写完让新词立即生效（重载输入法宿主，无需注销）
   OpenIME.exe undo                        # 撤销最近一次导入
   OpenIME.exe history                     # 查看操作历史
   OpenIME.exe import-comp                 # 导入内置古诗文竞赛库（116 首）
@@ -65,6 +66,10 @@ def run_cli(argv) -> int:
 
     sub.add_parser("status", help="状态")
     sub.add_parser("backup", help="备份")
+    sub.add_parser(
+        "reload-ime",
+        help="重载输入法宿主进程（TextInputHost），让词库改动立即生效；无需注销/重启电脑",
+    )
     sub.add_parser("undo", help="撤销最近一次导入（删除那批词条）")
     sub.add_parser("history", help="查看导入/删除/替换历史")
     sub.add_parser(
@@ -127,7 +132,15 @@ def run_cli(argv) -> int:
                 print("  +", w)
             if preview.add_count > 30:
                 print(f"  … 共 {preview.add_count} 条")
-            ans = input(f"写入 {preview.add_count} 条? [y/N] ").strip().lower()
+            # windowed exe 里 stdin 为 None，input() 会裸崩（第四轮只挡了 read 分支）
+            if sys.stdin is None:
+                print(f"图形打包版无法交互确认，请加 --yes 后重试（本次未写入，共 {preview.add_count} 条待确认）")
+                return 1
+            try:
+                ans = input(f"写入 {preview.add_count} 条? [y/N] ").strip().lower()
+            except (EOFError, RuntimeError):
+                print("未读到确认输入，已取消")
+                return 0
             if ans not in ("y", "yes"):
                 print("已取消")
                 return 0
@@ -160,6 +173,10 @@ def run_cli(argv) -> int:
         return 0
     elif args.command == "undo":
         r = app_core.undo_last_import()
+    elif args.command == "reload-ime":
+        r = app_core.reload_ime()
+        print(("成功" if r.ok else "失败") + f"：{r.message}")
+        return 0 if r.ok else 1
     elif args.command == "import-comp":
         r = app_core.import_competition_library()
     elif args.command == "history":

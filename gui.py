@@ -10,7 +10,7 @@ import os
 import csv
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import List, Optional
 
 import app_core
@@ -48,6 +48,8 @@ BUILTIN_PACKS = [
     ("化学", "词库包_初三化学.txt"),
     ("古诗文", "词库包_古诗文比赛.txt"),
 ]
+
+LOG_MAX_LINES = 800  # 记录区只留最近若干行，防止长时间运行无限增长
 
 
 class App(tk.Tk):
@@ -110,11 +112,13 @@ class App(tk.Tk):
         )
         cb.pack(side="left", padx=8)
         cb.current(0)
+        self.mode_cb = cb
         self.latin_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
+        self.latin_cb = tk.Checkbutton(
             row2, text="同时提取英文术语", variable=self.latin_var,
             bg=PANEL, font=("Microsoft YaHei UI", 10),
-        ).pack(side="left", padx=12)
+        )
+        self.latin_cb.pack(side="left", padx=12)
 
         # 内置词库包
         boxp = ttk.LabelFrame(self, text=" 内置词库包（一键导入） ", style="Box.TLabelframe")
@@ -143,8 +147,11 @@ class App(tk.Tk):
         row4 = ttk.Frame(box2, style="Card.TFrame")
         row4.pack(fill="x", padx=10, pady=(0, 8))
         self._btn(row4, "历史…", self.on_history, False).pack(side="left", padx=(0, 6))
+        self._btn(row4, "重载输入法", self.on_reload_ime, False).pack(side="left", padx=(0, 6))
         ttk.Label(
-            row4, text="查看最近写入记录（导入 / 删除 / 替换 / 改拼音 / 恢复）", style="Card.TLabel",
+            row4,
+            text="查看最近写入记录；「重载输入法」= 让刚写入的新词立即生效（输入法条闪一下，正常）",
+            style="Card.TLabel",
         ).pack(side="left")
 
         # 状态
@@ -158,11 +165,16 @@ class App(tk.Tk):
         # 日志
         lg = ttk.LabelFrame(self, text=" 记录 ", style="Box.TLabelframe")
         lg.pack(fill="both", expand=True, padx=18, pady=(4, 10))
+        lg_inner = ttk.Frame(lg)
+        lg_inner.pack(fill="both", expand=True, padx=8, pady=8)
         self.log = tk.Text(
-            lg, wrap="word", bg="#FFFFFF", fg=INK,
+            lg_inner, wrap="word", bg="#FFFFFF", fg=INK,
             font=("Microsoft YaHei UI", 10), relief="flat", padx=10, pady=8,
         )
-        self.log.pack(fill="both", expand=True, padx=8, pady=8)
+        log_sb = ttk.Scrollbar(lg_inner, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=log_sb.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        log_sb.pack(side="right", fill="y")
         self.log.configure(state="disabled")
 
         ttk.Label(
@@ -198,6 +210,10 @@ class App(tk.Tk):
     def append_log(self, text: str):
         self.log.configure(state="normal")
         self.log.insert("end", text.rstrip() + "\n")
+        # 内容以换行结尾时 "end-1c" 折叠回上一行行尾，行数按 "end - 1 char" 读才准
+        line_count = len(self.log.get("1.0", "end - 1 char").splitlines())
+        if line_count > LOG_MAX_LINES:
+            self.log.delete("1.0", f"{line_count - LOG_MAX_LINES + 1}.0")
         self.log.see("end")
         self.log.configure(state="disabled")
 
@@ -209,6 +225,15 @@ class App(tk.Tk):
                 b.configure(state=state)
             except Exception:
                 pass
+        try:
+            self.mode_cb.configure(state="disabled" if busy else "readonly")
+            self.latin_cb.configure(state=state)
+        except Exception:
+            pass
+        try:
+            self.configure(cursor="watch" if busy else "")
+        except Exception:
+            pass
         if msg:
             self.status_var.set(msg)
 
@@ -237,6 +262,7 @@ class App(tk.Tk):
 
     def _run_async(self, fn, title="完成", on_done=None):
         if self._busy:
+            self.status_var.set("已有操作进行中，请稍候…")
             return
         self.set_busy(True, "处理中…")
 
@@ -273,6 +299,7 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _confirm_preview(self, terms: List[str], source_desc: str) -> Optional[List[str]]:
+        """返回 None=用户取消；[]=确认但无新增；非空=写入这批。"""
         preview = app_core.preview_add(terms, source_desc)
         win = tk.Toplevel(self)
         win.title("导入预览")
@@ -281,17 +308,14 @@ class App(tk.Tk):
         win.transient(self)
         win.grab_set()
 
-        msg = (
-            f"{source_desc}\n"
-            f"有效候选 {len(terms)} 条 → 新增 {preview.add_count} 条，"
-            f"已存在 {len(preview.already)} 条，规则过滤 {len(preview.rejected)} 条。\n"
-            f"导入后词库约 {preview.total_after} 条。"
-        )
+        msg = "\n".join(preview.describe())
         ttk.Label(win, text="确认导入", style="Title.TLabel").pack(anchor="w", padx=16, pady=(12, 4))
         ttk.Label(win, text=msg, style="TLabel", wraplength=600, justify="left").pack(anchor="w", padx=16)
 
         box = ttk.Frame(win)
         box.pack(fill="both", expand=True, padx=16, pady=8)
+        list_title = "将新增的词条" if preview.add_count else "已在词库中的词条"
+        ttk.Label(box, text=list_title, style="Sub.TLabel").pack(anchor="w", pady=(0, 2))
         lb = tk.Listbox(box, font=("Microsoft YaHei UI", 10))
         sb = ttk.Scrollbar(box, orient="vertical", command=lb.yview)
         lb.configure(yscrollcommand=sb.set)
@@ -303,31 +327,31 @@ class App(tk.Tk):
         if preview.add_count > 200:
             lb.insert("end", f"… 另有 {preview.add_count - 200} 条未列出")
 
-        holder = {"ok": False}
+        holder = {"result": None}
 
         def do_ok():
-            holder["ok"] = True
+            holder["result"] = preview.to_add
+            win.destroy()
+
+        def do_nothing():
+            holder["result"] = []
             win.destroy()
 
         def do_cancel():
             win.destroy()
 
+        win.bind("<Escape>", lambda _e: do_cancel())
         btns = ttk.Frame(win)
         btns.pack(pady=10)
-        tk.Button(
-            btns, text=f"写入 {preview.add_count} 条", command=do_ok,
-            bg=BTN_BG, fg=BTN_FG, relief="flat",
-            font=("Microsoft YaHei UI", 12, "bold"), padx=16, pady=8, cursor="hand2",
-        ).pack(side="left", padx=6)
-        tk.Button(
-            btns, text="取消", command=do_cancel,
-            bg=PANEL, relief="groove", font=("Microsoft YaHei UI", 11), padx=12, pady=8, cursor="hand2",
-        ).pack(side="left", padx=6)
+        if preview.add_count:
+            self._btn(btns, f"写入 {preview.add_count} 条", do_ok, primary=True, register=False).pack(side="left", padx=6)
+            self._btn(btns, "取消", do_cancel, primary=False, register=False).pack(side="left", padx=6)
+        else:
+            self._btn(btns, "知道了（无新增）", do_nothing, primary=True, register=False).pack(side="left", padx=6)
+            self._btn(btns, "关闭", do_cancel, primary=False, register=False).pack(side="left", padx=6)
 
         win.wait_window()
-        if holder["ok"]:
-            return preview.to_add
-        return None
+        return holder["result"]
 
     # ---------- actions ----------
     def on_pick_files(self):
@@ -375,6 +399,19 @@ class App(tk.Tk):
 
         self._run_async(work, "撤销上次导入")
 
+    def on_reload_ime(self):
+        if self._busy:
+            self.status_var.set("已有操作进行中，请稍候…")
+            return
+        if not messagebox.askyesno(
+            "重载输入法",
+            "结束并重启微软拼音宿主进程，让它重新读取用户词库。\n\n"
+            "· 不用注销、不用重启电脑，进程由系统自动拉起\n"
+            "· 输入法候选条会闪断一下，正在打字的内容不受影响\n\n现在执行？",
+        ):
+            return
+        self._run_async(app_core.reload_ime, "重载输入法")
+
     def _import_flow(self, paths: List[str], mode: str, latin: bool, title: str, then=None):
         """读取文档 → 抽词 → 预览确认 → 写入。then：整条流程结束后（含取消/无词条）再执行。"""
         if self._busy:
@@ -417,8 +454,13 @@ class App(tk.Tk):
                         then()
                     return
                 picked = self._confirm_preview(terms, desc)
-                if not picked:
+                if picked is None:
                     self.append_log("已取消导入")
+                    if then:
+                        then()
+                    return
+                if not picked:
+                    self.append_log("预览确认：候选都已在词库中，无词条可写")
                     if then:
                         then()
                     return
@@ -439,6 +481,9 @@ class App(tk.Tk):
         self.refresh_status()
 
     def on_paste(self):
+        if self._busy:
+            self.status_var.set("已有操作进行中，请稍候…")
+            return
         win = tk.Toplevel(self)
         win.title("粘贴文本")
         win.configure(bg=BG)
@@ -449,40 +494,53 @@ class App(tk.Tk):
         text = tk.Text(win, wrap="word", font=("Microsoft YaHei UI", 11), height=16)
         text.pack(fill="both", expand=True, padx=14, pady=4)
         text.insert("1.0", "产品经理\n需求评审\n技术方案\n发版窗口\n")
+        win.bind("<Escape>", lambda _e: win.destroy())
 
         def do():
             content = text.get("1.0", "end")
             win.destroy()
             mode = self._mode_id()
             latin = self.latin_var.get()
+            self.set_busy(True, "正在抽取粘贴文本…")
 
-            def stage():
-                from term_extractor import extract
-                res = extract(content, mode=mode, include_latin=latin)
-                terms = res.get("terms") or []
-                return terms, f"粘贴文本 mode={mode}"
-
-            def run():
+            def stage1():
+                # 抽取是纯 CPU 操作，放 worker 线程，长文不再冻住界面
                 try:
-                    terms, desc = stage()
+                    from term_extractor import extract
+                    res = extract(content, mode=mode, include_latin=latin)
+                    terms = res.get("terms") or []
                 except Exception as e:
-                    messagebox.showerror("出错了", str(e))
+                    self.after(0, lambda: self._fail_busy(str(e)))
                     return
-                if not terms:
-                    messagebox.showwarning("没有词条", "未能抽出有效词条")
-                    return
-                picked = self._confirm_preview(terms, desc)
-                if picked:
-                    self._run_async(lambda: app_core.apply_tokens(picked, source_desc=desc), "导入文本")
 
-            self.after(0, run)
+                def stage2():
+                    self.set_busy(False)
+                    if not terms:
+                        messagebox.showwarning("没有词条", "未能抽出有效词条")
+                        self.refresh_status()
+                        return
+                    picked = self._confirm_preview(terms, f"粘贴文本 mode={mode}")
+                    if picked is None:
+                        self.append_log("已取消导入")
+                        return
+                    if not picked:
+                        self.append_log("预览确认：候选都已在词库中，无词条可写")
+                        return
+                    self._run_async(
+                        lambda: app_core.apply_tokens(picked, source_desc=f"粘贴文本 mode={mode}"),
+                        "导入文本",
+                    )
 
-        tk.Button(
-            win, text="预览导入", command=do, bg=BTN_BG, fg=BTN_FG, relief="flat",
-            font=("Microsoft YaHei UI", 12, "bold"), padx=16, pady=8, cursor="hand2",
-        ).pack(pady=10)
+                self.after(0, stage2)
+
+            threading.Thread(target=stage1, daemon=True).start()
+
+        self._btn(win, "预览导入", do, primary=True, register=False).pack(pady=10)
 
     def on_add_words(self):
+        if self._busy:
+            self.status_var.set("已有操作进行中，请稍候…")
+            return
         win = tk.Toplevel(self)
         win.title("添加词条")
         win.configure(bg=BG)
@@ -492,6 +550,7 @@ class App(tk.Tk):
         ttk.Label(win, text="一行一个词条（2–12 字）", style="TLabel").pack(anchor="w", padx=14, pady=10)
         text = tk.Text(win, height=10, font=("Microsoft YaHei UI", 11))
         text.pack(fill="both", expand=True, padx=14, pady=4)
+        win.bind("<Escape>", lambda _e: win.destroy())
 
         def do():
             raw = text.get("1.0", "end")
@@ -499,10 +558,7 @@ class App(tk.Tk):
             words = [ln.strip() for ln in raw.splitlines() if ln.strip()]
             self._run_async(lambda: app_core.add_words(words), "添加词条")
 
-        tk.Button(
-            win, text="写入", command=do, bg=BTN_BG, fg=BTN_FG, relief="flat",
-            font=("Microsoft YaHei UI", 12, "bold"), padx=16, pady=8, cursor="hand2",
-        ).pack(pady=10)
+        self._btn(win, "写入", do, primary=True, register=False).pack(pady=10)
 
     def on_view(self):
         win = tk.Toplevel(self)
@@ -512,7 +568,7 @@ class App(tk.Tk):
         win.minsize(720, 480)
         win.transient(self)
 
-        state = {"page": 0, "page_size": 80}
+        state = {"page": 0, "page_size": 80, "parts": {}}
 
         top = ttk.Frame(win)
         top.pack(fill="x", padx=12, pady=(10, 4))
@@ -521,9 +577,23 @@ class App(tk.Tk):
         kw.pack(side="left", padx=6)
         ttk.Label(
             top,
-            text="可输入：明月 / mingyue / ming yue / my",
+            text="可输入：明月 / mingyue / ming yue / my　　多选：点一条，Shift 连选、Ctrl 加选",
             style="Sub.TLabel",
         ).pack(side="left", padx=8)
+
+        prow = ttk.Frame(win)
+        prow.pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Label(prow, text="分区：").pack(side="left")
+        ALL_PARTS = app_core.PARTITION_ALL_NAME  # 后端同拒此保留名，两处不会漂移
+        part_cb = ttk.Combobox(prow, state="readonly", width=52, values=[ALL_PARTS])
+        part_cb.pack(side="left", padx=6)
+        part_cb.set(ALL_PARTS)
+        self._btn(prow, "选中存入分区…",
+                  lambda: self._store_partition(tree, part_cb, win, reload_parts, on_part_select),
+                  False, register=False).pack(side="left", padx=(6, 0))
+        self._btn(prow, "分区清除", lambda: clear_partition(win, part_cb),
+                  False, register=False).pack(side="left", padx=(6, 0))
+        ttk.Label(prow, text="清除=删除该分区记录的词条（自动先备份）", style="Sub.TLabel").pack(side="left", padx=8)
 
         mid = ttk.Frame(win)
         mid.pack(fill="both", expand=True, padx=12, pady=4)
@@ -532,6 +602,7 @@ class App(tk.Tk):
             columns=("no", "word", "pinyin", "jianpin"),
             show="headings",
             height=16,
+            selectmode="extended",
         )
         tree.heading("no", text="#")
         tree.heading("word", text="词条")
@@ -551,13 +622,27 @@ class App(tk.Tk):
         info = ttk.Label(bottom, text="", style="Sub.TLabel")
         info.pack(side="left")
 
+        def reload_parts(keep_selection: bool = True):
+            try:
+                state["parts"] = {p["name"]: p for p in app_core.list_partitions()}
+            except Exception as e:
+                messagebox.showerror("错误", f"读取分区失败：{e}", parent=win)
+                return
+            cur = part_cb.get() if keep_selection else ALL_PARTS
+            names = [ALL_PARTS] + list(state["parts"].keys())
+            part_cb["values"] = names
+            part_cb.set(cur if cur in names else ALL_PARTS)
+
         def refresh():
             tree.delete(*tree.get_children())
+            pname = part_cb.get()
+            part = state["parts"].get(pname)
             try:
                 r = app_core.query_entries(
                     keyword=kw.get().strip(),
                     page=state["page"],
                     page_size=state["page_size"],
+                    only_words=part["words"] if part else None,
                 )
             except Exception as e:
                 messagebox.showerror("错误", str(e), parent=win)
@@ -575,7 +660,8 @@ class App(tk.Tk):
             info.configure(
                 text=(
                     f"词库 {r['total_all']} 条"
-                    + (f"｜筛选 {r['total']} 条" if r["keyword"] else "")
+                    + (f"｜分区「{pname}」{r['total']} 条" if part else "")
+                    + (f"｜筛选 {r['total']} 条" if (r["keyword"] and not part) else "")
                     + f"｜第 {r['page']+1}/{r['pages']} 页"
                     + (f"｜{dist_s}" if dist_s else "")
                 )
@@ -588,6 +674,47 @@ class App(tk.Tk):
         def do_search(*_):
             state["page"] = 0
             refresh()
+
+        def on_part_select(*_):
+            state["page"] = 0
+            refresh()
+
+        part_cb.bind("<<ComboboxSelected>>", on_part_select)
+
+        def clear_partition(_win, _cb):
+            pname = _cb.get()
+            part = state["parts"].get(pname)
+            if not part:
+                messagebox.showinfo("提示", "请先在「分区」下拉里选中一个分区，再做分区清除。", parent=_win)
+                return
+            n = len(part["words"])
+            extra = (
+                "\n注意：这是导入批次自动分区，清除后该批的导入历史一并移除，\n"
+                "「撤销上次导入」将指向更早的批次。"
+                if part["kind"] == "auto" else ""
+            )
+            ok = messagebox.askyesno(
+                "确认分区清除",
+                f"清除分区「{pname}」？\n\n"
+                f"该分区记录 {n} 条词条，会先自动备份词库，再把其中仍在词库的词条删掉，\n"
+                "并移除这条分区记录。其它词、其它分区不受影响。\n\n"
+                "（词库文件本体不会清空，只删这批词。）" + extra,
+                parent=_win,
+            )
+            if not ok:
+                return
+
+            def work():
+                return app_core.remove_partition(pname, delete_words=True)
+
+            def after_done(_r):
+                reload_parts()
+                refresh()
+                self.refresh_status()
+
+            self._run_async(work, "分区清除", on_done=after_done)
+
+        reload_parts(keep_selection=False)
 
         def do_delete():
             sel = tree.selection()
@@ -625,7 +752,12 @@ class App(tk.Tk):
             if not dest:
                 return
             try:
-                r = app_core.query_entries(keyword=kw.get().strip(), page=0, page_size=10**9)
+                pname = part_cb.get()
+                part = state["parts"].get(pname)
+                r = app_core.query_entries(
+                    keyword=kw.get().strip(), page=0, page_size=10**9,
+                    only_words=part["words"] if part else None,
+                )
                 items = r["items"]
                 if dest.lower().endswith(".csv"):
                     with open(dest, "w", encoding="utf-8-sig", newline="") as f:
@@ -712,10 +844,39 @@ class App(tk.Tk):
             )
 
         win.bind("<Return>", do_ok)
-        tk.Button(
-            win, text="保存", command=do_ok, bg=BTN_BG, fg=BTN_FG, relief="flat",
-            font=("Microsoft YaHei UI", 11, "bold"), padx=14, pady=6, cursor="hand2",
-        ).pack(pady=6)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self._btn(win, "保存", do_ok, primary=True, register=False).pack(pady=6)
+
+    def _store_partition(self, tree, part_cb, parent_win, reload_parts, refresh):
+        if self._busy:
+            self.status_var.set("已有操作进行中，请稍候…")
+            return
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo(
+                "提示", "先在列表里选中词条（点一条，Shift 连选、Ctrl 加选），再存入分区。",
+                parent=parent_win,
+            )
+            return
+        words = [tree.item(i, "values")[1] for i in sel]
+        name = simpledialog.askstring(
+            "存入分区", f"把选中的 {len(words)} 条词条存入分区（重名则合并）：",
+            parent=parent_win,
+        )
+        if not name:
+            return
+        r = app_core.create_partition(name, words)
+        if not r.ok:
+            messagebox.showwarning("分区", r.message, parent=parent_win)
+            return
+        reload_parts()
+        final = r.data.get("name") or name
+        if final in part_cb["values"]:
+            part_cb.set(final)
+        # 程序化 set() 不触发 <<ComboboxSelected>>，切视图回调必须显式刷新
+        refresh()
+        self.append_log(f"✓ {r.message}")
+        messagebox.showinfo("分区", r.message, parent=parent_win)
 
     def on_backup(self):
         def work():
@@ -741,6 +902,7 @@ class App(tk.Tk):
         lb.pack(fill="both", expand=True, padx=14, pady=4)
         for b in backups:
             lb.insert("end", b)
+        win.bind("<Escape>", lambda _e: win.destroy())
 
         def do():
             sel = lb.curselection()
@@ -753,10 +915,7 @@ class App(tk.Tk):
             win.destroy()
             self._run_async(lambda: app_core.restore_backup(path), "恢复")
 
-        tk.Button(
-            win, text="恢复", command=do, bg=BTN_BG, fg=BTN_FG, relief="flat",
-            font=("Microsoft YaHei UI", 12, "bold"), padx=16, pady=8, cursor="hand2",
-        ).pack(pady=10)
+        self._btn(win, "恢复", do, primary=True, register=False).pack(pady=10)
 
     def on_export(self):
         dest = filedialog.asksaveasfilename(
@@ -860,16 +1019,11 @@ class App(tk.Tk):
             recs = app_core.list_history()
             fill()
 
+        win.bind("<Escape>", lambda _e: win.destroy())
         bottom = ttk.Frame(win)
         bottom.pack(fill="x", padx=12, pady=(0, 10))
-        tk.Button(
-            bottom, text="刷新", command=do_refresh, bg=PANEL, relief="groove",
-            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
-        ).pack(side="left")
-        tk.Button(
-            bottom, text="关闭", command=win.destroy, bg=PANEL, relief="groove",
-            font=("Microsoft YaHei UI", 10), padx=10, pady=4, cursor="hand2",
-        ).pack(side="right")
+        self._btn(bottom, "刷新", do_refresh, primary=False, register=False).pack(side="left")
+        self._btn(bottom, "关闭", win.destroy, primary=False, register=False).pack(side="right")
         fill()
 
 
